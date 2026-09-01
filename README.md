@@ -159,8 +159,9 @@ arm64, and ARMv7 plus macOS and Windows amd64/arm64. It also builds `.deb` and
 `.rpm` packages for every Linux architecture and validates package metadata,
 archive contents, and checksums.
 
-The `release` GitHub workflow validates the version in `version.go`, creates the
-requested immutable tag, and publishes those archives with `SHA256SUMS` to a
-GitHub Release. `SHA256SUMS` covers archives, Linux packages, and the Windows
-install script. `publish-binaries` can resume a draft release after an upload
-failure, but it refuses to replace assets on a published release.
+The `release` GitHub workflow validates the version in `version.go`, refuses to
+reuse an existing tag, creates an annotated tag, and publishes those archives
+with `SHA256SUMS` to a GitHub Release. `SHA256SUMS` covers archives, Linux
+packages, and the Windows install script. `publish-binaries` can resume a draft
+release after an upload failure, but it refuses to replace assets on a published
+release.

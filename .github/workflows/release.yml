@@ -1,5 +1,5 @@
 # The only workflow that creates release tags. It gates the exact main commit,
-# creates an immutable annotated tag, then explicitly publishes binaries because
+# creates a new annotated tag, then explicitly publishes binaries because
 # GITHUB_TOKEN tag pushes do not start another workflow.
 name: release
 
