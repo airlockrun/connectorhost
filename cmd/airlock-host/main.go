@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -30,22 +32,34 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "__airlock_shell" {
 		os.Exit(connectorhost.RunShellHelper(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
-	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
+	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-func run(args []string, stdout, stderr io.Writer) error {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	global := flag.NewFlagSet("airlock-host", flag.ContinueOnError)
 	global.SetOutput(stderr)
+	global.Usage = func() { writeUsage(stderr) }
 	stateDirectory := global.String("state-dir", "", "independent host state directory")
 	if err := global.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
 		return err
 	}
 	args = global.Args()
 	if len(args) == 0 {
-		return usageError()
+		writeUsage(stdout)
+		return nil
+	}
+	if args[0] == "help" {
+		if len(args) != 1 {
+			return errors.New("airlock-host: help takes no arguments")
+		}
+		writeUsage(stdout)
+		return nil
 	}
 	if args[0] == "version" {
 		if len(args) != 1 {
@@ -58,7 +72,10 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if *stateDirectory != "" {
 			return errors.New("airlock-host: managed services use a fixed machine state directory; do not pass --state-dir")
 		}
-		return serviceCommand(args[1:], stdout, stderr)
+		return serviceCommand(args[1:], stdin, stdout, stderr)
+	}
+	if args[0] == "enroll" {
+		return enrollCommand(*stateDirectory, args[1:], stdin, stdout, stderr)
 	}
 	if *stateDirectory == "" {
 		root, err := defaultStateDirectory()
@@ -85,22 +102,93 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return accessCommand(*stateDirectory, args[1:], stdout)
 	case "connector":
 		return connectorCommand(*stateDirectory, args[1:], stdout, stderr)
-	case "enroll":
-		set := flag.NewFlagSet("enroll", flag.ContinueOnError)
-		set.SetOutput(stderr)
-		airlock := set.String("airlock", "", "Airlock HTTPS origin")
-		if err := set.Parse(args[1:]); err != nil {
-			return err
-		}
-		if set.NArg() != 0 || *airlock == "" {
-			return errors.New("airlock-host: enroll requires --airlock HTTPS-origin")
-		}
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-		defer stop()
-		return enrollHost(ctx, *stateDirectory, *airlock, stdout)
 	default:
-		return usageError()
+		writeUsage(stderr)
+		return fmt.Errorf("airlock-host: unknown command %q", args[0])
 	}
+}
+
+func enrollCommand(stateDirectory string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	airlockURL, mode, err := parseEnrollmentOptions("enroll", args, stdin, stdout, stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if stateDirectory != "" {
+		return enrollHost(ctx, stateDirectory, airlockURL, mode, stdout)
+	}
+	manager, err := newNativeServiceManager()
+	if err != nil {
+		return err
+	}
+	return enrollManagedService(ctx, manager, airlockURL, mode, stdout)
+}
+
+func parseEnrollmentOptions(command string, args []string, stdin io.Reader, stdout, stderr io.Writer) (string, connectorhost.AccessMode, error) {
+	set := flag.NewFlagSet(command, flag.ContinueOnError)
+	set.SetOutput(stderr)
+	airlockURL := set.String("airlock", "", "Airlock HTTPS origin")
+	modeValue := set.String("mode", "", "remote management mode: full, update_only, or none")
+	if err := set.Parse(args); err != nil {
+		return "", "", err
+	}
+	if set.NArg() != 0 || *airlockURL == "" {
+		return "", "", fmt.Errorf("airlock-host: %s requires --airlock HTTPS-origin", command)
+	}
+	if err := connectorhost.ValidateAirlockOrigin(*airlockURL); err != nil {
+		return "", "", err
+	}
+	mode, err := selectEnrollmentMode(*modeValue, stdin, stdout, isInteractiveInput(stdin))
+	if err != nil {
+		return "", "", err
+	}
+	return *airlockURL, mode, nil
+}
+
+func selectEnrollmentMode(value string, input io.Reader, output io.Writer, interactive bool) (connectorhost.AccessMode, error) {
+	if value != "" {
+		return connectorhost.ParseAccessMode(value)
+	}
+	if !interactive {
+		return "", errors.New("airlock-host: enrollment requires --mode full|update_only|none when input is not interactive")
+	}
+	_, _ = fmt.Fprintln(output, "Select the remote management mode for this host:")
+	_, _ = fmt.Fprintln(output, "  1) full        allow install, update, remove, rollback, and shell")
+	_, _ = fmt.Fprintln(output, "  2) update_only allow update and rollback of existing connectors")
+	_, _ = fmt.Fprintln(output, "  3) none        disable remote management; connector jobs still run")
+	scanner := bufio.NewScanner(input)
+	for {
+		_, _ = fmt.Fprint(output, "Mode [1/2/3]: ")
+		if !scanner.Scan() {
+			if err := scanner.Err(); err != nil {
+				return "", err
+			}
+			return "", errors.New("airlock-host: no enrollment mode selected")
+		}
+		switch strings.TrimSpace(scanner.Text()) {
+		case "1", "full":
+			return connectorhost.AccessFull, nil
+		case "2", "update_only":
+			return connectorhost.AccessUpdateOnly, nil
+		case "3", "none":
+			return connectorhost.AccessNone, nil
+		default:
+			_, _ = fmt.Fprintln(output, "Enter 1, 2, 3, full, update_only, or none.")
+		}
+	}
+}
+
+func isInteractiveInput(input io.Reader) bool {
+	file, ok := input.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
 }
 
 func accessCommand(root string, args []string, stdout io.Writer) error {
@@ -403,18 +491,22 @@ func runHost(ctx context.Context, stateDirectory string, controlPort int) error 
 	return connectorhost.NewHost(store, nil).ServeControl(ctx, controlPort)
 }
 
-func enrollHost(ctx context.Context, stateDirectory, airlockURL string, output io.Writer) error {
+func enrollHost(ctx context.Context, stateDirectory, airlockURL string, mode connectorhost.AccessMode, output io.Writer) error {
 	store, err := connectorhost.OpenStore(stateDirectory)
 	if err == nil {
 		defer store.Close()
-		return connectorhost.Enroll(ctx, store, airlockURL, output)
+		persistedURL, credential := store.Credentials()
+		if persistedURL != "" || credential != "" {
+			return errors.New("airlock-host: host is already enrolled")
+		}
+		return connectorhost.Enroll(ctx, store, airlockURL, mode, output)
 	}
 	if !errors.Is(err, connectorhost.ErrStateLocked) {
 		return err
 	}
 	return controlFirst(stateDirectory, false,
 		func(ctx context.Context, client *connectorhost.LocalControlClient) error {
-			return client.Enroll(ctx, airlockURL, func(prompt connectorhost.EnrollmentPrompt) error {
+			return client.Enroll(ctx, airlockURL, mode, func(prompt connectorhost.EnrollmentPrompt) error {
 				_, err := fmt.Fprintf(output, "Open: %s\nCode: %s\n", prompt.VerificationURL, prompt.UserCode)
 				return err
 			})
@@ -424,6 +516,30 @@ func enrollHost(ctx context.Context, stateDirectory, airlockURL string, output i
 		})
 }
 
-func usageError() error {
-	return errors.New("usage: airlock-host [--state-dir DIR] <serve|access|connector|enroll|service|version>")
+func writeUsage(output io.Writer) {
+	_, _ = fmt.Fprint(output, `Airlock Connector Host
+
+Managed host quick start:
+  sudo airlock-host enroll --airlock https://airlock.example
+  sudo airlock-host enroll --airlock https://airlock.example --mode full
+
+The interactive enrollment flow asks for full, update_only, or none. Use
+--mode for noninteractive enrollment.
+
+Usage:
+  airlock-host enroll --airlock HTTPS-ORIGIN [--mode MODE]
+  airlock-host access get
+  airlock-host access set full|update_only|none
+  airlock-host connector <install|update|rollback|remove|list|status>
+  airlock-host service <install|start|stop|status|uninstall|enroll>
+  airlock-host version
+
+Standalone mode:
+  airlock-host --state-dir DIR enroll --airlock HTTPS-ORIGIN [--mode MODE]
+  airlock-host --state-dir DIR serve [--control-port PORT]
+
+Options:
+  --state-dir DIR  use an independent standalone state directory
+  -h, --help       show this help
+`)
 }

@@ -282,7 +282,7 @@ func TestWindowsSCMServiceLifecycle(t *testing.T) {
 	cleanup()
 	t.Cleanup(cleanup)
 
-	if output := runService(binary, "install"); output != "installed" {
+	if output := runService(binary, "install"); !strings.HasPrefix(output, "installed\nNext:\n") {
 		t.Fatalf("install output = %q", output)
 	}
 	serviceSID, _, _, err := windows.LookupSID("", `NT SERVICE\`+nativeServiceName)
@@ -365,7 +365,7 @@ func main() {
 	if err := os.WriteFile(upgradeBinary, body, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if output := runService(upgradeBinary, "install"); output != "installed" {
+	if output := runService(upgradeBinary, "install"); !strings.HasPrefix(output, "installed\nNext:\n") {
 		t.Fatalf("upgrade install output = %q", output)
 	}
 	if output := runService(upgradeBinary, "start"); output != "running" {
@@ -386,7 +386,7 @@ func main() {
 	if err := os.WriteFile(manager.executablePath, []byte("corrupt"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if output := runService(binary, "install"); output != "installed" {
+	if output := runService(binary, "install"); !strings.HasPrefix(output, "installed\nNext:\n") {
 		t.Fatalf("repair install output = %q", output)
 	}
 	if err := validateExecutable(manager.executablePath); err != nil {

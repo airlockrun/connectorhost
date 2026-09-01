@@ -26,8 +26,16 @@ for index in "${!linux_labels[@]}"; do
     echo "unexpected RPM payload in $package" >&2
     exit 1
   fi
-  if [[ -n "$(rpm -qp --scripts "$package")" ]]; then
-    echo "RPM package contains an unexpected scriptlet: $package" >&2
+  scriptlets="$(rpm -qp --scripts "$package")"
+  if [[ "$scriptlets" != *"host=/usr/bin/airlock-host"* ]] ||
+    [[ "$scriptlets" != *'"$host" service install'* ]] ||
+    [[ "$scriptlets" != *'"$host" service uninstall'* ]]; then
+    echo "RPM package does not contain the expected service lifecycle scriptlets: $package" >&2
+    exit 1
+  fi
+  requires="$(rpm -qp --requires "$package")"
+  if [[ $'\n'"$requires"$'\n' != *$'\nsystemd\n'* ]] || [[ $'\n'"$requires"$'\n' != *$'\nshadow-utils\n'* ]]; then
+    echo "RPM package does not declare service dependencies: $package" >&2
     exit 1
   fi
 done

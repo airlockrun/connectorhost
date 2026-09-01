@@ -80,6 +80,67 @@ jobs:
         run: |
           go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_VERSION"
           ./scripts/build-release.sh
+      - name: Native Debian package lifecycle
+        run: |
+          cleanup() {
+            sudo dpkg --remove airlock-host >/dev/null 2>&1 || true
+            sudo /usr/local/bin/airlock-host service uninstall >/dev/null 2>&1 || true
+            sudo rm -rf /var/lib/airlock-host /usr/local/bin/airlock-host
+          }
+          trap cleanup EXIT
+          packages=(dist/*-linux-amd64.deb)
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "::error::expected one amd64 Debian package"
+            exit 1
+          fi
+
+          sudo dpkg --install "${packages[0]}"
+          systemctl is-enabled --quiet airlock-host.service
+          first_status="$(sudo airlock-host service status)"
+          [[ "$first_status" == running$'\t'* ]]
+
+          sudo airlock-host service stop
+          sudo dpkg --install "${packages[0]}"
+          [[ "$(sudo airlock-host service status)" == stopped ]]
+          systemctl is-enabled --quiet airlock-host.service
+
+          sudo systemctl disable --now airlock-host.service
+          sudo dpkg --install "${packages[0]}"
+          [[ "$(sudo airlock-host service status)" == stopped ]]
+          ! systemctl is-enabled --quiet airlock-host.service
+
+          sudo systemctl enable airlock-host.service
+          sudo airlock-host service start
+          before_upgrade="$(sudo airlock-host service status)"
+          sudo dpkg --install "${packages[0]}"
+          after_upgrade="$(sudo airlock-host service status)"
+          [[ "$after_upgrade" == running$'\t'* ]]
+          [[ "$after_upgrade" != "$before_upgrade" ]]
+
+          sudo dpkg --remove airlock-host
+          [[ ! -e /etc/systemd/system/airlock-host.service ]]
+          [[ -d /var/lib/airlock-host ]]
+      - name: Offline RPM package lifecycle
+        run: |
+          packages=(dist/*-linux-amd64.rpm)
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "::error::expected one amd64 RPM package"
+            exit 1
+          fi
+          docker run --rm \
+            --volume "$PWD/dist:/dist:ro" \
+            --env "PACKAGE_NAME=$(basename "${packages[0]}")" \
+            "$RPM_VALIDATOR_IMAGE" \
+            bash -euo pipefail -c '
+              dnf install --assumeyes "/dist/$PACKAGE_NAME"
+              test -x /usr/bin/airlock-host
+              test -x /usr/local/bin/airlock-host
+              test -f /etc/systemd/system/airlock-host.service
+              test -d /var/lib/airlock-host
+              rpm --erase airlock-host
+              test ! -e /etc/systemd/system/airlock-host.service
+              test -d /var/lib/airlock-host
+            '
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: airlock-host-binaries-${{ github.sha }}

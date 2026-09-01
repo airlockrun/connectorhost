@@ -38,14 +38,14 @@ type EnrollmentPrompt struct {
 	ExpiresAt       time.Time `json:"expiresAt"`
 }
 
-func Enroll(ctx context.Context, store *Store, baseURL string, output io.Writer) error {
-	return EnrollWithPrompt(ctx, store, baseURL, http.DefaultClient, func(prompt EnrollmentPrompt) error {
+func Enroll(ctx context.Context, store *Store, baseURL string, mode AccessMode, output io.Writer) error {
+	return EnrollWithPrompt(ctx, store, baseURL, mode, http.DefaultClient, func(prompt EnrollmentPrompt) error {
 		_, err := fmt.Fprintf(output, "Open: %s\nCode: %s\n", prompt.VerificationURL, prompt.UserCode)
 		return err
 	})
 }
 
-func EnrollWithPrompt(ctx context.Context, store *Store, baseURL string, httpClient *http.Client, prompt func(EnrollmentPrompt) error) error {
+func EnrollWithPrompt(ctx context.Context, store *Store, baseURL string, mode AccessMode, httpClient *http.Client, prompt func(EnrollmentPrompt) error) error {
 	if store == nil {
 		panic("connectorhost: enrollment store is required")
 	}
@@ -55,15 +55,17 @@ func EnrollWithPrompt(ctx context.Context, store *Store, baseURL string, httpCli
 	if prompt == nil {
 		panic("connectorhost: enrollment prompt callback is required")
 	}
-	parsed, err := url.Parse(baseURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return errors.New("connectorhost: Airlock URL must be an HTTPS origin")
+	if _, err := ParseAccessMode(string(mode)); err != nil {
+		return err
 	}
-	baseURL = strings.TrimSuffix(baseURL, "/")
+	baseURL, err := normalizeAirlockOrigin(baseURL)
+	if err != nil {
+		return err
+	}
 	client := *httpClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	name, _ := os.Hostname()
-	request := protocol.HostInfo{ProtocolVersion: protocol.HostProtocolVersion, Name: name, Platform: runtime.GOOS, Architecture: platformArchitecture(), AccessMode: store.AccessMode(), Version: Version}
+	request := protocol.HostInfo{ProtocolVersion: protocol.HostProtocolVersion, Name: name, Platform: runtime.GOOS, Architecture: platformArchitecture(), AccessMode: mode, Version: Version}
 	var device hostDeviceCodeResponse
 	if err := enrollmentPost(ctx, &client, baseURL+"/api/hosts/v1/enroll/device-code", request, &device); err != nil {
 		return err
@@ -94,7 +96,7 @@ func EnrollWithPrompt(ctx context.Context, store *Store, baseURL string, httpCli
 			if response.HostID == "" || response.Credential == "" {
 				return errors.New("connectorhost: approved enrollment omitted host credentials")
 			}
-			return store.SetCredentials(baseURL, response.Credential, response.HostID)
+			return store.SetEnrollment(baseURL, response.Credential, response.HostID, mode)
 		case "pending":
 		case "denied":
 			return errors.New("connectorhost: enrollment denied")
@@ -107,6 +109,19 @@ func EnrollWithPrompt(ctx context.Context, store *Store, baseURL string, httpCli
 			return err
 		}
 	}
+}
+
+func ValidateAirlockOrigin(baseURL string) error {
+	_, err := normalizeAirlockOrigin(baseURL)
+	return err
+}
+
+func normalizeAirlockOrigin(baseURL string) (string, error) {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("connectorhost: Airlock URL must be an HTTPS origin")
+	}
+	return strings.TrimSuffix(baseURL, "/"), nil
 }
 
 func enrollmentPost(ctx context.Context, client *http.Client, endpoint string, input, output any) error {

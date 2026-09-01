@@ -18,13 +18,38 @@ if (-not $PSCmdlet.ShouldProcess($resolvedBinary, "Install the AirlockHost Windo
     return
 }
 
-& $resolvedBinary service install
+$statusOutput = & $resolvedBinary service status 2>$null
+$statusExitCode = $LASTEXITCODE
+if ($statusExitCode -ne 0) {
+    throw "airlock-host service status failed with exit code $statusExitCode"
+}
+$wasInstalled = $statusOutput -notmatch '^not-installed'
+$wasRunning = $statusOutput -match '^(running|start-pending)'
+
+& $resolvedBinary service install | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "airlock-host service install failed with exit code $LASTEXITCODE"
 }
 
 $installedBinary = Join-Path $env:ProgramFiles "Airlock\airlock-host.exe"
-Write-Host "The AirlockHost service is installed but not started."
+if (-not $wasInstalled -or $wasRunning) {
+    if ($wasRunning) {
+        & $installedBinary service stop | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "airlock-host service stop failed with exit code $LASTEXITCODE"
+        }
+    }
+    & $installedBinary service start | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "airlock-host service start failed with exit code $LASTEXITCODE"
+    }
+} else {
+    Write-Host "The AirlockHost service was updated and remains stopped."
+    Write-Host "Start it when ready:"
+    Write-Host "  & `"$installedBinary`" service start"
+    return
+}
+
+Write-Host "The AirlockHost service is installed and running."
 Write-Host "Complete the explicit enrollment flow:"
-Write-Host "  & `"$installedBinary`" service start"
-Write-Host "  & `"$installedBinary`" service enroll --airlock https://airlock.example"
+Write-Host "  & `"$installedBinary`" enroll --airlock https://airlock.example"

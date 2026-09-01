@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+
+	connectorhost "github.com/airlockrun/connectorhost"
 )
 
 const (
@@ -44,7 +46,7 @@ type nativeServiceManager interface {
 	StateDirectory() string
 }
 
-func serviceCommand(args []string, stdout, stderr io.Writer) error {
+func serviceCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return serviceUsageError()
 	}
@@ -62,7 +64,10 @@ func serviceCommand(args []string, stdout, stderr io.Writer) error {
 		if err := manager.Install(ctx); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintln(stdout, "installed")
+		_, err := fmt.Fprintln(stdout, `installed
+Next:
+  airlock-host service start
+  airlock-host enroll --airlock https://airlock.example`)
 		return err
 	case "start":
 		if len(args) != 1 {
@@ -108,26 +113,54 @@ func serviceCommand(args []string, stdout, stderr io.Writer) error {
 		_, err := fmt.Fprintln(stdout, "uninstalled")
 		return err
 	case "enroll":
-		set := flag.NewFlagSet("service enroll", flag.ContinueOnError)
-		set.SetOutput(stderr)
-		airlockURL := set.String("airlock", "", "Airlock HTTPS origin")
-		if err := set.Parse(args[1:]); err != nil {
-			return err
-		}
-		if set.NArg() != 0 || *airlockURL == "" {
-			return errors.New("airlock-host: service enroll requires --airlock HTTPS-origin")
-		}
-		status, err := manager.Status(ctx)
+		airlockURL, mode, err := parseEnrollmentOptions("service enroll", args[1:], stdin, stdout, stderr)
 		if err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
 			return err
 		}
-		if status.State != serviceRunning {
-			return fmt.Errorf("airlock-host: service must be running before enrollment (state: %s)", status.State)
-		}
-		return enrollHost(ctx, manager.StateDirectory(), *airlockURL, stdout)
+		return enrollManagedService(ctx, manager, airlockURL, mode, stdout)
 	default:
 		return serviceUsageError()
 	}
+}
+
+func enrollManagedService(ctx context.Context, manager nativeServiceManager, airlockURL string, mode connectorhost.AccessMode, stdout io.Writer) error {
+	status, err := manager.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if status.State == serviceNotInstalled {
+		return errors.New("airlock-host: managed service is not installed; install the Linux package or run 'airlock-host service install'")
+	}
+	if status.State == servicePaused {
+		return errors.New("airlock-host: managed service is paused; resume it before enrollment")
+	}
+	if status.State != serviceRunning {
+		if status.State != serviceStartPending {
+			if err := requireUnenrolledState(manager.StateDirectory()); err != nil {
+				return err
+			}
+		}
+		if err := manager.Start(ctx); err != nil {
+			return err
+		}
+	}
+	return enrollHost(ctx, manager.StateDirectory(), airlockURL, mode, stdout)
+}
+
+func requireUnenrolledState(stateDirectory string) error {
+	store, err := connectorhost.OpenStore(stateDirectory)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	airlockURL, credential := store.Credentials()
+	if airlockURL != "" || credential != "" {
+		return errors.New("airlock-host: host is already enrolled")
+	}
+	return nil
 }
 
 func serviceUsageError() error {

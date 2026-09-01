@@ -86,11 +86,23 @@ if command -v dpkg-deb >/dev/null 2>&1; then
       echo "unexpected Debian package architecture: $package" >&2
       exit 1
     fi
+    dependencies="$(dpkg-deb --field "$package" Depends)"
+    if [[ "$dependencies" != *"systemd"* ]] || [[ "$dependencies" != *"passwd"* ]]; then
+      echo "Debian package does not declare service dependencies: $package" >&2
+      exit 1
+    fi
     package_contents="$(dpkg-deb --fsys-tarfile "$package" | tar -tf -)"
     if [[ $'\n'"$package_contents"$'\n' != *$'\n./usr/bin/airlock-host\n'* ]]; then
       echo "Debian package does not contain /usr/bin/airlock-host: $package" >&2
       exit 1
     fi
+    control_contents="$(dpkg-deb --ctrl-tarfile "$package" | tar -tf -)"
+    for script in postinst prerm; do
+      if [[ $'\n'"$control_contents"$'\n' != *$'\n./'"$script"$'\n'* ]]; then
+        echo "Debian package does not contain $script: $package" >&2
+        exit 1
+      fi
+    done
   done
 else
   echo "dpkg-deb is not installed; skipped Debian metadata inspection" >&2

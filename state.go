@@ -189,6 +189,22 @@ func (s *Store) SetCredentials(baseURL, credential, hostID string) error {
 	return nil
 }
 
+func (s *Store) SetEnrollment(baseURL, credential, hostID string, mode AccessMode) error {
+	if _, err := ParseAccessMode(string(mode)); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.state
+	candidate.AirlockURL, candidate.Credential, candidate.HostID = baseURL, credential, hostID
+	candidate.AccessMode = mode
+	if err := s.saveStateLocked(candidate); err != nil {
+		return err
+	}
+	s.state = candidate
+	return nil
+}
+
 func (s *Store) HostID() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

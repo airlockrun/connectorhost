@@ -104,10 +104,10 @@ func (m *linuxServiceManager) Install(ctx context.Context) error {
 	if err := writeFileIfNeeded(ctx, m.paths.unitFile, []byte(m.systemdUnit()), 0o644); err != nil {
 		return fmt.Errorf("airlock-host: install systemd unit: %w", err)
 	}
-	if err := m.checkedCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+	if err := m.checkedCommand(ctx, "systemctl", "enable", linuxServiceUnitName); err != nil {
 		return err
 	}
-	return m.checkedCommand(ctx, "systemctl", "enable", linuxServiceUnitName)
+	return m.reloadSystemd(ctx)
 }
 
 func (m *linuxServiceManager) Start(ctx context.Context) error {
@@ -401,6 +401,18 @@ func (m *linuxServiceManager) checkedCommand(ctx context.Context, name string, a
 		return commandError(name, output, err)
 	}
 	return nil
+}
+
+func (m *linuxServiceManager) reloadSystemd(ctx context.Context) error {
+	output, err := m.command(ctx, "systemctl", "daemon-reload")
+	if err == nil {
+		return nil
+	}
+	message := string(output)
+	if strings.Contains(message, "System has not been booted with systemd") || strings.Contains(message, "Failed to connect to bus") {
+		return nil
+	}
+	return commandError("systemctl", output, err)
 }
 
 func (m *linuxServiceManager) command(ctx context.Context, name string, args ...string) ([]byte, error) {

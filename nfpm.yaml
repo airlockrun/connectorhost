@@ -9,6 +9,18 @@ priority: optional
 maintainer: Airlock <support@airlock.run>
 description: Airlock connector host runtime
 homepage: https://airlock.run
+scripts:
+  postinstall: scripts/package-postinstall.sh
+  preremove: scripts/package-preremove.sh
+overrides:
+  deb:
+    depends:
+      - systemd
+      - passwd
+  rpm:
+    depends:
+      - systemd
+      - shadow-utils
 contents:
   - src: ${NFPM_BINARY}
     dst: /usr/bin/airlock-host

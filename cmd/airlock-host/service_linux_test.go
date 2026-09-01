@@ -106,8 +106,8 @@ func TestLinuxInstallIsIdempotent(t *testing.T) {
 		{name: "getent", args: []string{"passwd", "airlock-host"}},
 		{name: "passwd", args: []string{"--status", "airlock-host"}},
 		{name: "chown", args: []string{"--recursive", "--no-dereference", "airlock-host:airlock-host", manager.paths.stateDirectory}},
-		{name: "systemctl", args: []string{"daemon-reload"}},
 		{name: "systemctl", args: []string{"enable", "airlock-host.service"}},
+		{name: "systemctl", args: []string{"daemon-reload"}},
 	}
 	if !reflect.DeepEqual(calls, wantCalls) {
 		t.Fatalf("commands = %#v, want %#v", calls, wantCalls)
@@ -156,6 +156,39 @@ func TestLinuxInstallIsIdempotent(t *testing.T) {
 		if call.name == "useradd" || call.name == "systemctl" && len(call.args) > 0 && call.args[0] == "start" {
 			t.Fatalf("unexpected command on repeated install: %#v", call)
 		}
+	}
+}
+
+func TestLinuxInstallToleratesOfflineSystemdManager(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "airlock-host")
+	if err := os.WriteFile(sourcePath, []byte("executable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := newTestLinuxServiceManager(root, sourcePath, func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "id" && len(args) > 0 && args[0] == "--group" {
+			return []byte("airlock-host\n"), nil
+		}
+		if name == "id" && len(args) > 0 && args[0] == "--user" {
+			return []byte("999\n"), nil
+		}
+		if name == "getent" {
+			return []byte("airlock-host:x:999:999::" + managerStateDirectory(root) + ":/usr/sbin/nologin\n"), nil
+		}
+		if name == "passwd" {
+			return []byte("airlock-host L 2026-09-01 0 99999 7 -1\n"), nil
+		}
+		if name == "systemctl" && len(args) > 0 && args[0] == "daemon-reload" {
+			return []byte("System has not been booted with systemd as init system (PID 1). Can't operate.\nFailed to connect to bus: Host is down\n"), linuxTestExitError(1)
+		}
+		return nil, nil
+	})
+	manager.passwdFile = filepath.Join(root, "passwd")
+	if err := os.WriteFile(manager.passwdFile, []byte("airlock-host:x:999:999::"+manager.paths.stateDirectory+":/usr/sbin/nologin\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Install(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -289,4 +322,8 @@ func newTestLinuxServiceManager(root, sourcePath string, runner linuxCommandRunn
 		passwdFile:     filepath.Join(root, "passwd"),
 		commandTimeout: time.Second,
 	}
+}
+
+func managerStateDirectory(root string) string {
+	return filepath.Join(root, "var lib", "airlock-host")
 }

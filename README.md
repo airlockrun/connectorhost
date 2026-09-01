@@ -19,8 +19,7 @@ trusted Airlock builds and protect the host account as one trust domain.
 ## CLI
 
 ```text
-airlock-host [--state-dir DIR] serve [--control-port PORT]
-airlock-host [--state-dir DIR] enroll --airlock https://airlock.example
+airlock-host enroll --airlock https://airlock.example [--mode full|update_only|none]
 airlock-host [--state-dir DIR] access get
 airlock-host [--state-dir DIR] access set full|update_only|none
 airlock-host [--state-dir DIR] connector list
@@ -30,8 +29,14 @@ airlock-host [--state-dir DIR] connector update ID ./connector [--settings setti
 airlock-host [--state-dir DIR] connector rollback ID
 airlock-host [--state-dir DIR] connector remove ID
 airlock-host service install|start|stop|status|uninstall
-airlock-host service enroll --airlock https://airlock.example
+airlock-host service enroll --airlock https://airlock.example [--mode full|update_only|none]
+airlock-host --state-dir DIR enroll --airlock https://airlock.example [--mode full|update_only|none]
+airlock-host --state-dir DIR serve [--control-port PORT]
 ```
+
+Without `--state-dir`, `enroll` targets the managed machine service and starts it
+if necessary. Interactive enrollment asks which remote management mode to use.
+Pass `--mode` explicitly for scripts and other noninteractive input.
 
 Each state root has an exclusive process lock. Run multiple host instances with
 different `--state-dir` values and control ports. The serving process listens on
@@ -108,22 +113,35 @@ machine's external package or service manager.
 ## Managed service installation
 
 The `.deb` and `.rpm` packages install the release binary at
-`/usr/bin/airlock-host`. They do not install, enable, start, or enroll the
-managed service. Run the lifecycle explicitly after verifying the release
-checksum:
+`/usr/bin/airlock-host`, create the dedicated account and machine state,
+install and enable the systemd unit, and start the host in its safe unenrolled
+state. Package installation never contacts Airlock. After verifying the release
+checksum and installing the package, enroll the machine:
 
 ```sh
-sudo /usr/bin/airlock-host service install
-sudo /usr/local/bin/airlock-host service start
-sudo /usr/local/bin/airlock-host service enroll --airlock https://airlock.example
+sudo airlock-host enroll --airlock https://airlock.example
 ```
 
-`service install` creates the dedicated account, machine state, and native
-service definition, and copies the verified binary to its managed location. It
-does not start the service. The running service waits for the explicit
-`service enroll` flow before connecting to Airlock. After a package upgrade,
-run `/usr/bin/airlock-host service install` again to copy the new binary into
-the managed location, then restart the service explicitly.
+The interactive flow asks for `full`, `update_only`, or `none`. Noninteractive
+enrollment must select it directly, for example:
+
+```sh
+sudo airlock-host enroll --airlock https://airlock.example --mode update_only
+```
+
+The running service waits for explicit enrollment before connecting to Airlock.
+Package upgrades refresh the managed binary and restart an already-running
+service automatically.
+
+For a manually extracted archive, `service install` creates the dedicated
+account, machine state, and native service definition, and copies the verified
+binary to its managed location. It does not start the service:
+
+```sh
+sudo ./airlock-host service install
+sudo airlock-host service start
+sudo airlock-host enroll --airlock https://airlock.example
+```
 
 `service uninstall` removes the systemd or Windows SCM registration but
 intentionally preserves the managed binary and credential-bearing state. Delete
@@ -132,8 +150,8 @@ host is being permanently decommissioned.
 
 Windows ZIP archives contain `install-airlock-host.ps1`. Run it from an
 elevated PowerShell session after verifying `SHA256SUMS`; it delegates native
-registration and state ACL setup to `airlock-host service install` and does not
-start or enroll the service. The script is also published as a separate release
+registration and state ACL setup to `airlock-host service install` and starts
+the safe unenrolled service. The script is also published as a separate release
 artifact; place it beside the matching `airlock-host.exe` or pass
 `-BinaryPath` explicitly.
 

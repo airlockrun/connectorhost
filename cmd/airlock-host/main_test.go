@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -34,7 +35,7 @@ func TestAccessCommandUsesControlServerWhenStoreIsLocked(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(ctx) }()
 	var stdout, stderr bytes.Buffer
-	if err := run([]string{"--state-dir", root, "access", "set", "none"}, &stdout, &stderr); err != nil {
+	if err := run([]string{"--state-dir", root, "access", "set", "none"}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	if store.AccessMode() != connectorhost.AccessNone {
@@ -49,7 +50,7 @@ func TestAccessCommandUsesControlServerWhenStoreIsLocked(t *testing.T) {
 func TestAccessCommandFallsBackToDirectStore(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "instance")
 	var stdout, stderr bytes.Buffer
-	if err := run([]string{"--state-dir", root, "access", "set", "update_only"}, &stdout, &stderr); err != nil {
+	if err := run([]string{"--state-dir", root, "access", "set", "update_only"}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	store, err := connectorhost.OpenStore(root)
@@ -135,5 +136,49 @@ func TestMutatingControlLostResponseIsNotReplayed(t *testing.T) {
 				t.Fatalf("requests = %d, direct calls = %d", requests.Load(), directCalls.Load())
 			}
 		})
+	}
+}
+
+func TestEnrollmentModeFlagAndPrompt(t *testing.T) {
+	mode, err := selectEnrollmentMode("update_only", bytes.NewReader(nil), io.Discard, false)
+	if err != nil || mode != connectorhost.AccessUpdateOnly {
+		t.Fatalf("flag mode = %q, %v", mode, err)
+	}
+
+	var output bytes.Buffer
+	mode, err = selectEnrollmentMode("", bytes.NewBufferString("invalid\n3\n"), &output, true)
+	if err != nil || mode != connectorhost.AccessNone {
+		t.Fatalf("prompt mode = %q, %v", mode, err)
+	}
+	if !strings.Contains(output.String(), "connector jobs still run") || !strings.Contains(output.String(), "Enter 1, 2, 3") {
+		t.Fatalf("prompt output = %q", output.String())
+	}
+}
+
+func TestEnrollmentModeRequiredWithoutTerminal(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"enroll", "--airlock", "https://airlock.example"}, bytes.NewReader(nil), &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "requires --mode") {
+		t.Fatalf("run error = %v", err)
+	}
+}
+
+func TestRootHelpShowsManagedQuickStart(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := run(nil, bytes.NewReader(nil), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "Managed host quick start") || !strings.Contains(stdout.String(), "--mode") {
+		t.Fatalf("help output = %q", stdout.String())
+	}
+}
+
+func TestEnrollmentHelpReturnsSuccess(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := run([]string{"enroll", "--help"}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "-mode") {
+		t.Fatalf("help output = %q", stderr.String())
 	}
 }

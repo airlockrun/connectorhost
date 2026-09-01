@@ -241,7 +241,7 @@ func writeEnrollmentStream(ctx context.Context, w http.ResponseWriter, host *Hos
 		flusher.Flush()
 		return nil
 	}
-	err := host.LocalEnroll(ctx, input.AirlockURL, func(prompt EnrollmentPrompt) error {
+	err := host.LocalEnroll(ctx, input.AirlockURL, input.Mode, func(prompt EnrollmentPrompt) error {
 		return writeEvent(LocalEnrollmentEvent{
 			Type:            LocalEnrollmentVerification,
 			VerificationURL: prompt.VerificationURL,
@@ -422,11 +422,11 @@ func (c *LocalControlClient) SetAccess(ctx context.Context, mode AccessMode) err
 	return c.do(ctx, http.MethodPost, "/v1/access", LocalAccessRequest{Mode: mode}, nil)
 }
 
-func (c *LocalControlClient) Enroll(ctx context.Context, baseURL string, prompt func(EnrollmentPrompt) error) error {
+func (c *LocalControlClient) Enroll(ctx context.Context, baseURL string, mode AccessMode, prompt func(EnrollmentPrompt) error) error {
 	if prompt == nil {
 		panic("connectorhost: enrollment prompt callback is required")
 	}
-	body, err := json.Marshal(LocalEnrollRequest{AirlockURL: baseURL})
+	body, err := json.Marshal(LocalEnrollRequest{AirlockURL: baseURL, Mode: mode})
 	if err != nil {
 		return err
 	}

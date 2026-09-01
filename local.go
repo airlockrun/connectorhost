@@ -38,7 +38,8 @@ type LocalAccessRequest struct {
 }
 
 type LocalEnrollRequest struct {
-	AirlockURL string `json:"airlockUrl"`
+	AirlockURL string     `json:"airlockUrl"`
+	Mode       AccessMode `json:"mode"`
 }
 
 type LocalEnrollmentEvent struct {
@@ -71,7 +72,7 @@ type LocalConnectorStatus struct {
 	Manifest        protocol.HostedConnectorManifest `json:"manifest"`
 }
 
-func (h *Host) LocalEnroll(ctx context.Context, baseURL string, prompt func(EnrollmentPrompt) error) error {
+func (h *Host) LocalEnroll(ctx context.Context, baseURL string, mode AccessMode, prompt func(EnrollmentPrompt) error) error {
 	if !h.enrollmentMu.TryLock() {
 		return errors.New("connectorhost: enrollment is already in progress")
 	}
@@ -80,7 +81,7 @@ func (h *Host) LocalEnroll(ctx context.Context, baseURL string, prompt func(Enro
 	if airlockURL != "" || credential != "" {
 		return errors.New("connectorhost: host is already enrolled")
 	}
-	if err := EnrollWithPrompt(ctx, h.store, baseURL, h.httpClient, prompt); err != nil {
+	if err := EnrollWithPrompt(ctx, h.store, baseURL, mode, h.httpClient, prompt); err != nil {
 		return err
 	}
 	h.signalCredentialsReady()
