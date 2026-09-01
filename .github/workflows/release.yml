@@ -1,0 +1,77 @@
+# The only workflow that creates release tags. It gates the exact main commit,
+# creates an immutable annotated tag, then explicitly publishes binaries because
+# GITHUB_TOKEN tag pushes do not start another workflow.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version, for example v0.1.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Validate version and tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta|dev)\.[0-9]+)?$ ]]; then
+            echo "::error::version must look like vX.Y.Z or vX.Y.Z-rc.N"
+            exit 1
+          fi
+          if git rev-parse "$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "::error::tag $RELEASE_VERSION already exists"
+            exit 1
+          fi
+          source_version="$(go run ./cmd/airlock-host version)"
+          if [[ "$source_version" != "airlock-host $RELEASE_VERSION" ]]; then
+            echo "::error::source reports $source_version, not airlock-host $RELEASE_VERSION"
+            exit 1
+          fi
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -count=1 ./...
+      - name: Race test
+        run: go test -race -count=1 ./...
+      - name: Build all release binaries
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: ./scripts/build-release.sh
+
+  tag:
+    needs: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create and push tag
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git tag -a "$RELEASE_VERSION" -m "$RELEASE_VERSION"
+          git push origin "$RELEASE_VERSION"
+
+  publish:
+    needs: tag
+    uses: ./.github/workflows/publish-binaries.yml
+    with:
+      version: ${{ inputs.version }}
+    permissions:
+      contents: write
