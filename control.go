@@ -31,6 +31,7 @@ const (
 	maxControlReplyBytes = 8 << 20
 	controlTimeout       = 31 * time.Minute
 	controlDescriptor    = "control.json"
+	enrollmentMediaType  = "application/x-ndjson"
 )
 
 type ControlDescriptor struct {
@@ -86,7 +87,7 @@ func NewLocalControlServer(host *Host, port int) (*LocalControlServer, error) {
 	control.server = &http.Server{
 		Handler:           control.handler(host),
 		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       time.Minute,
+		ReadTimeout:       controlTimeout,
 		WriteTimeout:      controlTimeout,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    16 << 10,
@@ -96,6 +97,7 @@ func NewLocalControlServer(host *Host, port int) (*LocalControlServer, error) {
 }
 
 func (s *LocalControlServer) Serve(ctx context.Context) error {
+	s.server.BaseContext = func(net.Listener) context.Context { return ctx }
 	shutdown := make(chan struct{})
 	go func() {
 		select {
@@ -180,12 +182,16 @@ func (s *LocalControlServer) handler(host *Host) http.Handler {
 			}
 			result, err := host.LocalInstall(ctx, input)
 			writeControlResult(w, result, err)
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/connectors/install-upload":
+			writeControlUploadResult(ctx, w, request, host, false)
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/connectors/update":
 			var input LocalUpdateRequest
 			if !decodeControlRequest(w, request, &input) {
 				return
 			}
 			writeControlResult(w, struct{}{}, host.LocalUpdate(ctx, input))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/connectors/update-upload":
+			writeControlUploadResult(ctx, w, request, host, true)
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/connectors/rollback":
 			var input LocalConnectorRequest
 			if !decodeControlRequest(w, request, &input) {
@@ -206,10 +212,48 @@ func (s *LocalControlServer) handler(host *Host) http.Handler {
 				return
 			}
 			writeControlResult(w, struct{}{}, host.store.SetAccessMode(input.Mode))
+		case request.Method == http.MethodPost && request.URL.Path == "/v1/enroll":
+			var input LocalEnrollRequest
+			if !decodeControlRequest(w, request, &input) {
+				return
+			}
+			writeEnrollmentStream(ctx, w, host, input)
 		default:
 			writeControlError(w, http.StatusNotFound, "connectorhost: local control endpoint not found")
 		}
 	})
+}
+
+func writeEnrollmentStream(ctx context.Context, w http.ResponseWriter, host *Host, input LocalEnrollRequest) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeControlError(w, http.StatusInternalServerError, "connectorhost: local control enrollment streaming is unavailable")
+		return
+	}
+	w.Header().Set("Content-Type", enrollmentMediaType)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	encoder := json.NewEncoder(w)
+	writeEvent := func(event LocalEnrollmentEvent) error {
+		if err := encoder.Encode(event); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+	err := host.LocalEnroll(ctx, input.AirlockURL, func(prompt EnrollmentPrompt) error {
+		return writeEvent(LocalEnrollmentEvent{
+			Type:            LocalEnrollmentVerification,
+			VerificationURL: prompt.VerificationURL,
+			UserCode:        prompt.UserCode,
+			ExpiresAt:       prompt.ExpiresAt,
+		})
+	})
+	if err != nil {
+		_ = writeEvent(LocalEnrollmentEvent{Type: LocalEnrollmentError, Error: err.Error()})
+		return
+	}
+	_ = writeEvent(LocalEnrollmentEvent{Type: LocalEnrollmentComplete})
 }
 
 func decodeControlRequest(w http.ResponseWriter, request *http.Request, output any) bool {
@@ -376,6 +420,81 @@ func (c *LocalControlClient) Access(ctx context.Context) (AccessMode, error) {
 
 func (c *LocalControlClient) SetAccess(ctx context.Context, mode AccessMode) error {
 	return c.do(ctx, http.MethodPost, "/v1/access", LocalAccessRequest{Mode: mode}, nil)
+}
+
+func (c *LocalControlClient) Enroll(ctx context.Context, baseURL string, prompt func(EnrollmentPrompt) error) error {
+	if prompt == nil {
+		panic("connectorhost: enrollment prompt callback is required")
+	}
+	body, err := json.Marshal(LocalEnrollRequest{AirlockURL: baseURL})
+	if err != nil {
+		return err
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/enroll", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+c.token)
+	request.Header.Set("Content-Type", "application/json")
+	response, err := c.http.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	mediaType := strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return readControlFailure(response, mediaType)
+	}
+	if mediaType != enrollmentMediaType {
+		return errors.New("connectorhost: local enrollment response is not application/x-ndjson")
+	}
+	decoder := json.NewDecoder(io.LimitReader(response.Body, maxControlReplyBytes+1))
+	decoder.DisallowUnknownFields()
+	for {
+		var event LocalEnrollmentEvent
+		if err := decoder.Decode(&event); err != nil {
+			if errors.Is(err, io.EOF) {
+				return errors.New("connectorhost: local enrollment response ended before completion")
+			}
+			return fmt.Errorf("connectorhost: decode local enrollment event: %w", err)
+		}
+		switch event.Type {
+		case LocalEnrollmentVerification:
+			if event.VerificationURL == "" || event.UserCode == "" || event.ExpiresAt.IsZero() || event.Error != "" {
+				return errors.New("connectorhost: invalid local enrollment verification event")
+			}
+			if err := prompt(EnrollmentPrompt{VerificationURL: event.VerificationURL, UserCode: event.UserCode, ExpiresAt: event.ExpiresAt}); err != nil {
+				return err
+			}
+		case LocalEnrollmentComplete:
+			if event.VerificationURL != "" || event.UserCode != "" || !event.ExpiresAt.IsZero() || event.Error != "" {
+				return errors.New("connectorhost: invalid local enrollment completion event")
+			}
+			return nil
+		case LocalEnrollmentError:
+			if event.Error == "" {
+				return errors.New("connectorhost: invalid local enrollment error event")
+			}
+			return errors.New(event.Error)
+		default:
+			return fmt.Errorf("connectorhost: unknown local enrollment event %q", event.Type)
+		}
+	}
+}
+
+func readControlFailure(response *http.Response, mediaType string) error {
+	if mediaType != "application/json" {
+		return fmt.Errorf("connectorhost: local control returned HTTP %d", response.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxControlReplyBytes+1))
+	if err != nil {
+		return err
+	}
+	var failure controlError
+	if len(body) > maxControlReplyBytes || strictJSON(body, &failure) != nil || failure.Error == "" {
+		failure.Error = fmt.Sprintf("connectorhost: local control returned HTTP %d", response.StatusCode)
+	}
+	return &LocalControlAPIError{Status: response.StatusCode, Text: failure.Error}
 }
 
 func (c *LocalControlClient) do(ctx context.Context, method, endpoint string, input, output any) error {

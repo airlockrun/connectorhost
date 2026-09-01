@@ -1,0 +1,17 @@
+name: airlock-host
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${NFPM_PACKAGE_VERSION}
+version_schema: none
+release: "1"
+section: default
+priority: optional
+maintainer: Airlock <support@airlock.run>
+description: Airlock connector host runtime
+homepage: https://airlock.run
+contents:
+  - src: ${NFPM_BINARY}
+    dst: /usr/bin/airlock-host
+    expand: true
+    file_info:
+      mode: 0755

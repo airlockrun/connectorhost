@@ -19,6 +19,14 @@ import (
 )
 
 func main() {
+	handled, err := runNativeService(os.Args[1:])
+	if handled {
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "__airlock_shell" {
 		os.Exit(connectorhost.RunShellHelper(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
@@ -29,13 +37,9 @@ func main() {
 }
 
 func run(args []string, stdout, stderr io.Writer) error {
-	root, err := defaultStateDirectory()
-	if err != nil {
-		return err
-	}
 	global := flag.NewFlagSet("airlock-host", flag.ContinueOnError)
 	global.SetOutput(stderr)
-	stateDirectory := global.String("state-dir", root, "independent host state directory")
+	stateDirectory := global.String("state-dir", "", "independent host state directory")
 	if err := global.Parse(args); err != nil {
 		return err
 	}
@@ -50,6 +54,19 @@ func run(args []string, stdout, stderr io.Writer) error {
 		_, err := fmt.Fprintf(stdout, "airlock-host v%s\n", connectorhost.Version)
 		return err
 	}
+	if args[0] == "service" {
+		if *stateDirectory != "" {
+			return errors.New("airlock-host: managed services use a fixed machine state directory; do not pass --state-dir")
+		}
+		return serviceCommand(args[1:], stdout, stderr)
+	}
+	if *stateDirectory == "" {
+		root, err := defaultStateDirectory()
+		if err != nil {
+			return err
+		}
+		*stateDirectory = root
+	}
 	switch args[0] {
 	case "serve":
 		set := flag.NewFlagSet("serve", flag.ContinueOnError)
@@ -61,14 +78,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if set.NArg() != 0 {
 			return errors.New("airlock-host: serve takes only --control-port")
 		}
-		store, err := connectorhost.OpenStore(*stateDirectory)
-		if err != nil {
-			return err
-		}
-		defer store.Close()
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return connectorhost.NewHost(store, nil).ServeControl(ctx, *controlPort)
+		return runHost(ctx, *stateDirectory, *controlPort)
 	case "access":
 		return accessCommand(*stateDirectory, args[1:], stdout)
 	case "connector":
@@ -83,14 +95,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if set.NArg() != 0 || *airlock == "" {
 			return errors.New("airlock-host: enroll requires --airlock HTTPS-origin")
 		}
-		store, err := connectorhost.OpenStore(*stateDirectory)
-		if err != nil {
-			return err
-		}
-		defer store.Close()
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return connectorhost.Enroll(ctx, store, *airlock, stdout)
+		return enrollHost(ctx, *stateDirectory, *airlock, stdout)
 	default:
 		return usageError()
 	}
@@ -162,7 +169,7 @@ func connectorCommand(root string, args []string, stdout, stderr io.Writer) erro
 		request := connectorhost.LocalInstallRequest{InstallationID: installationID, SourcePath: source, DisplayName: *name, ExpectedSHA256: *digest, Settings: settings}
 		return controlFirst(root, false,
 			func(ctx context.Context, client *connectorhost.LocalControlClient) error {
-				response, err := client.Install(ctx, request)
+				response, err := client.InstallFile(ctx, request)
 				if err == nil {
 					_, err = fmt.Fprintln(stdout, response.InstallationID)
 				}
@@ -200,7 +207,7 @@ func connectorCommand(root string, args []string, stdout, stderr io.Writer) erro
 		request := connectorhost.LocalUpdateRequest{InstallationID: args[1], SourcePath: source, ExpectedSHA256: *digest, Settings: settings}
 		return controlFirst(root, false,
 			func(ctx context.Context, client *connectorhost.LocalControlClient) error {
-				return client.Update(ctx, request)
+				return client.UpdateFile(ctx, request)
 			},
 			func(ctx context.Context, host *connectorhost.Host, _ *connectorhost.Store) error {
 				return host.LocalUpdate(ctx, request)
@@ -387,6 +394,36 @@ func defaultStateDirectory() (string, error) {
 	return filepath.Join(root, "airlock", "host"), nil
 }
 
+func runHost(ctx context.Context, stateDirectory string, controlPort int) error {
+	store, err := connectorhost.OpenStore(stateDirectory)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return connectorhost.NewHost(store, nil).ServeControl(ctx, controlPort)
+}
+
+func enrollHost(ctx context.Context, stateDirectory, airlockURL string, output io.Writer) error {
+	store, err := connectorhost.OpenStore(stateDirectory)
+	if err == nil {
+		defer store.Close()
+		return connectorhost.Enroll(ctx, store, airlockURL, output)
+	}
+	if !errors.Is(err, connectorhost.ErrStateLocked) {
+		return err
+	}
+	return controlFirst(stateDirectory, false,
+		func(ctx context.Context, client *connectorhost.LocalControlClient) error {
+			return client.Enroll(ctx, airlockURL, func(prompt connectorhost.EnrollmentPrompt) error {
+				_, err := fmt.Fprintf(output, "Open: %s\nCode: %s\n", prompt.VerificationURL, prompt.UserCode)
+				return err
+			})
+		},
+		func(context.Context, *connectorhost.Host, *connectorhost.Store) error {
+			return errors.New("airlock-host: serving host stopped during enrollment startup")
+		})
+}
+
 func usageError() error {
-	return errors.New("usage: airlock-host [--state-dir DIR] <serve|access|connector|enroll|version>")
+	return errors.New("usage: airlock-host [--state-dir DIR] <serve|access|connector|enroll|service|version>")
 }

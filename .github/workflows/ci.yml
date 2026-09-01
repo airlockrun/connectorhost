@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+env:
+  NFPM_VERSION: 2.47.0
+  ACTIONLINT_VERSION: 1.7.7
+  RPM_VALIDATOR_IMAGE: fedora@sha256:a651ddf48ea28a06ed4e1e6519f51c9f47e7a5a138722ade87369b8fbb7e5b42
+
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -17,43 +22,73 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
       - name: Test
         run: go test -count=1 ./...
+      - name: Native Windows service lifecycle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          AIRLOCK_TEST_WINDOWS_SCM: '1'
+        run: go test -count=1 -run '^TestWindowsSCMServiceLifecycle$' ./cmd/airlock-host
+      - name: Validate PowerShell installer syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/scripts/install-airlock-host.ps1",
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -ne 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
 
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
       - name: Vet
         run: go vet ./...
+      - name: Validate GitHub Actions workflows
+        run: |
+          go install "github.com/rhysd/actionlint/cmd/actionlint@v$ACTIONLINT_VERSION"
+          actionlint
       - name: Race test
         run: go test -race -count=1 ./...
 
   binaries:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
       - name: Build release binaries
-        run: ./scripts/build-release.sh
-      - uses: actions/upload-artifact@v4
+        run: |
+          go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_VERSION"
+          ./scripts/build-release.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: airlock-host-binaries-${{ github.sha }}
           path: |
             dist/*.tar.gz
             dist/*.zip
+            dist/*.deb
+            dist/*.rpm
+            dist/*.ps1
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14

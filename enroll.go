@@ -32,13 +32,35 @@ type hostEnrollmentResponse struct {
 	Error      string `json:"error,omitempty"`
 }
 
+type EnrollmentPrompt struct {
+	VerificationURL string    `json:"verificationUrl"`
+	UserCode        string    `json:"userCode"`
+	ExpiresAt       time.Time `json:"expiresAt"`
+}
+
 func Enroll(ctx context.Context, store *Store, baseURL string, output io.Writer) error {
+	return EnrollWithPrompt(ctx, store, baseURL, http.DefaultClient, func(prompt EnrollmentPrompt) error {
+		_, err := fmt.Fprintf(output, "Open: %s\nCode: %s\n", prompt.VerificationURL, prompt.UserCode)
+		return err
+	})
+}
+
+func EnrollWithPrompt(ctx context.Context, store *Store, baseURL string, httpClient *http.Client, prompt func(EnrollmentPrompt) error) error {
+	if store == nil {
+		panic("connectorhost: enrollment store is required")
+	}
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	if prompt == nil {
+		panic("connectorhost: enrollment prompt callback is required")
+	}
 	parsed, err := url.Parse(baseURL)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New("connectorhost: Airlock URL must be an HTTPS origin")
 	}
 	baseURL = strings.TrimSuffix(baseURL, "/")
-	client := *http.DefaultClient
+	client := *httpClient
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	name, _ := os.Hostname()
 	request := protocol.HostInfo{ProtocolVersion: protocol.HostProtocolVersion, Name: name, Platform: runtime.GOOS, Architecture: platformArchitecture(), AccessMode: store.AccessMode(), Version: Version}
@@ -53,7 +75,9 @@ func Enroll(ctx context.Context, store *Store, baseURL string, output io.Writer)
 	if err != nil || verification.User != nil || strings.ToLower(verification.Scheme+"://"+verification.Host) != strings.ToLower(baseURL) {
 		return errors.New("connectorhost: verification URL does not use the exact Airlock origin")
 	}
-	_, _ = fmt.Fprintf(output, "Open: %s\nCode: %s\n", device.VerificationURL, device.UserCode)
+	if err := prompt(EnrollmentPrompt{VerificationURL: device.VerificationURL, UserCode: device.UserCode, ExpiresAt: device.ExpiresAt}); err != nil {
+		return err
+	}
 	interval := time.Duration(device.PollIntervalSeconds) * time.Second
 	for {
 		if !device.ExpiresAt.After(time.Now()) {

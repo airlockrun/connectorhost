@@ -24,6 +24,8 @@ type Host struct {
 	clientMu           sync.RWMutex
 	client             *ControlClient
 	httpClient         *http.Client
+	enrollmentMu       sync.Mutex
+	credentialsReady   chan struct{}
 	managementMu       sync.Mutex
 	activeManagementMu sync.RWMutex
 	activeManagement   map[string]protocol.ActiveAttempt
@@ -36,7 +38,7 @@ func NewHost(store *Store, httpClient *http.Client) *Host {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	host := &Host{store: store, httpClient: httpClient, activeManagement: make(map[string]protocol.ActiveAttempt)}
+	host := &Host{store: store, httpClient: httpClient, credentialsReady: make(chan struct{}, 1), activeManagement: make(map[string]protocol.ActiveAttempt)}
 	host.installer = NewArtifactInstaller(store, httpClient)
 	host.supervisor = NewSupervisor(store, host)
 	return host
@@ -72,7 +74,10 @@ func (h *Host) ServeControl(ctx context.Context, controlPort int) error {
 }
 
 func (h *Host) serveRemote(ctx context.Context) error {
-	baseURL, credential := h.store.Credentials()
+	baseURL, credential, err := h.waitForCredentials(ctx)
+	if err != nil {
+		return err
+	}
 	client, err := NewControlClient(baseURL, credential, h.httpClient)
 	if err != nil {
 		return err
@@ -138,6 +143,27 @@ func (h *Host) serveRemote(ctx context.Context) error {
 		for _, item := range work.Work {
 			h.handleWork(ctx, item)
 		}
+	}
+}
+
+func (h *Host) waitForCredentials(ctx context.Context) (string, string, error) {
+	for {
+		baseURL, credential := h.store.Credentials()
+		if baseURL != "" || credential != "" {
+			return baseURL, credential, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		case <-h.credentialsReady:
+		}
+	}
+}
+
+func (h *Host) signalCredentialsReady() {
+	select {
+	case h.credentialsReady <- struct{}{}:
+	default:
 	}
 }
 

@@ -7,40 +7,153 @@ on:
         description: Existing release tag
         required: true
         type: string
+      commit:
+        description: Exact commit gated by the calling release workflow
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       version:
-        description: Existing release tag to republish
+        description: Existing release tag to publish
         required: true
         type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: connectorhost-publish-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  NFPM_VERSION: 2.47.0
+  RPM_VALIDATOR_IMAGE: fedora@sha256:a651ddf48ea28a06ed4e1e6519f51c9f47e7a5a138722ade87369b8fbb7e5b42
+
 jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: ${{ inputs.version }}
+          ref: refs/tags/${{ inputs.version }}
           fetch-depth: 0
-      - uses: actions/setup-go@v6
+          persist-credentials: false
+      - name: Verify release revision
+        env:
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          remote_tag_commit() {
+            read -r object_type object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+            if [[ "$object_type" == "tag" ]]; then
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq .object.sha
+            else
+              printf '%s\n' "$object_sha"
+            fi
+          }
+          tag_commit="$(git rev-list -n 1 "refs/tags/$RELEASE_VERSION")"
+          checkout_commit="$(git rev-parse HEAD)"
+          if [[ "$checkout_commit" != "$tag_commit" ]]; then
+            echo "::error::checkout $checkout_commit does not match tag commit $tag_commit"
+            exit 1
+          fi
+          if [[ -n "$EXPECTED_COMMIT" && "$tag_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo "::error::tag commit $tag_commit does not match gated commit $EXPECTED_COMMIT"
+            exit 1
+          fi
+          remote_commit="$(remote_tag_commit)"
+          if [[ "$remote_commit" != "$tag_commit" ]]; then
+            echo "::error::remote tag commit $remote_commit does not match checkout $tag_commit"
+            exit 1
+          fi
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
       - name: Build release binaries
         env:
           RELEASE_VERSION: ${{ inputs.version }}
-        run: ./scripts/build-release.sh
-      - name: Create or update GitHub release
+        run: |
+          go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_VERSION"
+          ./scripts/build-release.sh
+      - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
-          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_VERSION" dist/*.tar.gz dist/*.zip dist/SHA256SUMS --clobber
-          else
-            gh release create "$RELEASE_VERSION" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
-              --verify-tag --title "$RELEASE_VERSION" --generate-notes
+          remote_tag_commit() {
+            read -r object_type object_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )
+            if [[ "$object_type" == "tag" ]]; then
+              gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq .object.sha
+            else
+              printf '%s\n' "$object_sha"
+            fi
+          }
+          shopt -s nullglob
+          files=(dist/*.tar.gz dist/*.zip dist/*.deb dist/*.rpm dist/install-airlock-host.ps1 dist/SHA256SUMS)
+          expected=()
+          for file in "${files[@]}"; do
+            expected+=("${file##*/}")
+          done
+          tag_commit="$(git rev-list -n 1 "refs/tags/$RELEASE_VERSION")"
+          remote_commit="$(remote_tag_commit)"
+          if [[ "$remote_commit" != "$tag_commit" ]]; then
+            echo "::error::remote tag moved before publication"
+            exit 1
           fi
+          expected_prerelease=false
+          if [[ "$RELEASE_VERSION" == *-* ]]; then
+            expected_prerelease=true
+          fi
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_VERSION" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "::error::refusing to replace assets on published release $RELEASE_VERSION"
+              exit 1
+            fi
+            is_prerelease="$(gh release view "$RELEASE_VERSION" --json isPrerelease --jq .isPrerelease)"
+            if [[ "$is_prerelease" != "$expected_prerelease" ]]; then
+              echo "::error::draft prerelease status does not match $RELEASE_VERSION"
+              exit 1
+            fi
+            while IFS= read -r asset; do
+              found=false
+              for name in "${expected[@]}"; do
+                if [[ "$asset" == "$name" ]]; then
+                  found=true
+                  break
+                fi
+              done
+              if [[ "$found" != "true" ]]; then
+                echo "::error::draft release contains unexpected asset $asset"
+                exit 1
+              fi
+            done < <(gh release view "$RELEASE_VERSION" --json assets --jq '.assets[].name')
+          else
+            release_flags=()
+            if [[ "$expected_prerelease" == "true" ]]; then
+              release_flags+=(--prerelease)
+            fi
+            gh release create "$RELEASE_VERSION" --draft --verify-tag \
+              --title "$RELEASE_VERSION" --generate-notes "${release_flags[@]}"
+          fi
+          gh release upload "$RELEASE_VERSION" "${files[@]}" --clobber
+          mapfile -t published < <(gh release view "$RELEASE_VERSION" --json assets --jq '.assets[].name' | sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [[ "${published[*]}" != "${wanted[*]}" ]]; then
+            echo "::error::draft release asset set does not match the validated build"
+            exit 1
+          fi
+          remote_commit="$(remote_tag_commit)"
+          if [[ "$remote_commit" != "$tag_commit" ]]; then
+            echo "::error::remote tag moved during asset upload"
+            exit 1
+          fi
+          gh release edit "$RELEASE_VERSION" --draft=false

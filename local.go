@@ -17,6 +17,7 @@ type LocalInstallRequest struct {
 	SourcePath     string          `json:"sourcePath"`
 	DisplayName    string          `json:"displayName,omitempty"`
 	ExpectedSHA256 string          `json:"expectedSha256,omitempty"`
+	ArtifactSize   int64           `json:"artifactSize,omitempty"`
 	Settings       json.RawMessage `json:"settings,omitempty"`
 }
 
@@ -24,6 +25,7 @@ type LocalUpdateRequest struct {
 	InstallationID string          `json:"installationId"`
 	SourcePath     string          `json:"sourcePath"`
 	ExpectedSHA256 string          `json:"expectedSha256,omitempty"`
+	ArtifactSize   int64           `json:"artifactSize,omitempty"`
 	Settings       json.RawMessage `json:"settings,omitempty"`
 }
 
@@ -34,6 +36,24 @@ type LocalConnectorRequest struct {
 type LocalAccessRequest struct {
 	Mode AccessMode `json:"mode"`
 }
+
+type LocalEnrollRequest struct {
+	AirlockURL string `json:"airlockUrl"`
+}
+
+type LocalEnrollmentEvent struct {
+	Type            string    `json:"type"`
+	VerificationURL string    `json:"verificationUrl,omitempty"`
+	UserCode        string    `json:"userCode,omitempty"`
+	ExpiresAt       time.Time `json:"expiresAt,omitempty"`
+	Error           string    `json:"error,omitempty"`
+}
+
+const (
+	LocalEnrollmentVerification = "verification"
+	LocalEnrollmentComplete     = "complete"
+	LocalEnrollmentError        = "error"
+)
 
 type LocalInstallResponse struct {
 	InstallationID string `json:"installationId"`
@@ -49,6 +69,22 @@ type LocalConnectorStatus struct {
 	HasRollback     bool                             `json:"hasRollback"`
 	InstalledAt     time.Time                        `json:"installedAt"`
 	Manifest        protocol.HostedConnectorManifest `json:"manifest"`
+}
+
+func (h *Host) LocalEnroll(ctx context.Context, baseURL string, prompt func(EnrollmentPrompt) error) error {
+	if !h.enrollmentMu.TryLock() {
+		return errors.New("connectorhost: enrollment is already in progress")
+	}
+	defer h.enrollmentMu.Unlock()
+	airlockURL, credential := h.store.Credentials()
+	if airlockURL != "" || credential != "" {
+		return errors.New("connectorhost: host is already enrolled")
+	}
+	if err := EnrollWithPrompt(ctx, h.store, baseURL, h.httpClient, prompt); err != nil {
+		return err
+	}
+	h.signalCredentialsReady()
+	return nil
 }
 
 func (h *Host) LocalInstall(ctx context.Context, request LocalInstallRequest) (LocalInstallResponse, error) {

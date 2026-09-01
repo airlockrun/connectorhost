@@ -12,17 +12,26 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: connectorhost-release
+  cancel-in-progress: false
+
+env:
+  NFPM_VERSION: 2.47.0
+  RPM_VALIDATOR_IMAGE: fedora@sha256:a651ddf48ea28a06ed4e1e6519f51c9f47e7a5a138722ade87369b8fbb7e5b42
 
 jobs:
   gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
           cache: true
@@ -30,6 +39,10 @@ jobs:
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::releases must be dispatched from main"
+            exit 1
+          fi
           if ! [[ "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta|dev)\.[0-9]+)?$ ]]; then
             echo "::error::version must look like vX.Y.Z or vX.Y.Z-rc.N"
             exit 1
@@ -52,20 +65,27 @@ jobs:
       - name: Build all release binaries
         env:
           RELEASE_VERSION: ${{ inputs.version }}
-        run: ./scripts/build-release.sh
+        run: |
+          go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_VERSION"
+          ./scripts/build-release.sh
 
   tag:
     needs: gate
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - name: Create and push tag
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-          git tag -a "$RELEASE_VERSION" -m "$RELEASE_VERSION"
+          git tag -a "$RELEASE_VERSION" "$GITHUB_SHA" -m "$RELEASE_VERSION"
           git push origin "$RELEASE_VERSION"
 
   publish:
@@ -73,5 +93,6 @@ jobs:
     uses: ./.github/workflows/publish-binaries.yml
     with:
       version: ${{ inputs.version }}
+      commit: ${{ github.sha }}
     permissions:
       contents: write
