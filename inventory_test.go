@@ -129,7 +129,7 @@ func TestInventoryMutationLostResponseRetriesAndDoesNotBlockOthers(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	host := NewHost(store, server.Client())
+	host := newTestHost(store, server.Client())
 	host.flushInventoryMutations(t.Context(), client)
 	pending := store.PendingInventoryMutations()
 	if len(pending) != 1 || pending[0].InstallationID != inventoryID {
@@ -208,7 +208,7 @@ func TestInventoryAcknowledgementRestartsWithPersistedStorageOrigins(t *testing.
 			if err := store.SetAccessMode(AccessNone); err != nil {
 				t.Fatal(err)
 			}
-			host := NewHost(store, nil)
+			host := newTestHost(store, nil)
 			t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
 			appliedPath := filepath.Join(t.TempDir(), "origins.json")
 			pidPath := filepath.Join(t.TempDir(), "initialize.pid")

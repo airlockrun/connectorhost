@@ -164,6 +164,9 @@ func (s *LocalControlServer) handler(host *Host) http.Handler {
 		}
 		ctx, cancel := context.WithTimeout(request.Context(), controlTimeout)
 		defer cancel()
+		if request.Method == http.MethodPost {
+			host.logger.Info("local command received", "command", strings.TrimPrefix(request.URL.Path, "/v1/"))
+		}
 		switch {
 		case request.Method == http.MethodGet && request.URL.Path == "/v1/connectors":
 			statuses, err := host.LocalStatuses("")
@@ -211,7 +214,7 @@ func (s *LocalControlServer) handler(host *Host) http.Handler {
 			if !decodeControlRequest(w, request, &input) {
 				return
 			}
-			writeControlResult(w, struct{}{}, host.store.SetAccessMode(input.Mode))
+			writeControlResult(w, struct{}{}, host.SetAccessMode(input.Mode))
 		case request.Method == http.MethodPost && request.URL.Path == "/v1/enroll":
 			var input LocalEnrollRequest
 			if !decodeControlRequest(w, request, &input) {

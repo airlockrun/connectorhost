@@ -26,7 +26,7 @@ func TestLocalInstallBypassesRemoteAccessAndUpdatePreservesSettings(t *testing.T
 	if err := store.SetAccessMode(AccessNone); err != nil {
 		t.Fatal(err)
 	}
-	host := NewHost(store, nil)
+	host := newTestHost(store, nil)
 	t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -67,7 +67,7 @@ func TestLocalInstallRejectsDigestMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	host := NewHost(store, nil)
+	host := newTestHost(store, nil)
 	_, err = host.LocalInstall(t.Context(), LocalInstallRequest{InstallationID: "mismatch-id", SourcePath: executable, ExpectedSHA256: strings.Repeat("0", 64)})
 	if err == nil || len(store.Connectors()) != 0 {
 		t.Fatalf("digest mismatch error = %v, connectors = %d", err, len(store.Connectors()))
@@ -92,7 +92,7 @@ func TestCandidateReadinessPrecedesPersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	host := NewHost(store, nil)
+	host := newTestHost(store, nil)
 	t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
 	t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_READINESS", "fail")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -119,7 +119,7 @@ func TestInvalidLocalInstallIDDoesNotRemoveConnectorDirectory(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err = NewHost(store, nil).InstallLocal(t.Context(), LocalArtifactInput{InstallationID: "", SourcePath: "/missing"}, false)
+	_, err = newTestHost(store, nil).InstallLocal(t.Context(), LocalArtifactInput{InstallationID: "", SourcePath: "/missing"}, false)
 	if err == nil {
 		t.Fatal("empty installation ID accepted")
 	}

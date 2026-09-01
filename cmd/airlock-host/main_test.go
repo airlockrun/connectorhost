@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -26,7 +27,7 @@ func TestAccessCommandUsesControlServerWhenStoreIsLocked(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	host := connectorhost.NewHost(store, nil)
+	host := connectorhost.NewHost(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	server, err := connectorhost.NewLocalControlServer(host, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -44,6 +45,27 @@ func TestAccessCommandUsesControlServerWhenStoreIsLocked(t *testing.T) {
 	cancel()
 	if err := <-result; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagedCommandsUseManagedServiceState(t *testing.T) {
+	managed := func() (string, error) { return "/managed", nil }
+	standalone := func() (string, error) { return "/standalone", nil }
+	for _, command := range []string{"access", "connector"} {
+		root, err := resolveStateDirectory(command, managed, standalone)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if root != "/managed" {
+			t.Fatalf("%s state directory = %q", command, root)
+		}
+	}
+	root, err := resolveStateDirectory("serve", managed, standalone)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if root != "/standalone" {
+		t.Fatalf("serve state directory = %q", root)
 	}
 }
 

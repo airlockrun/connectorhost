@@ -19,7 +19,7 @@ func TestLocalControlUploadsConnectorArtifact(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	host := NewHost(store, nil)
+	host := newTestHost(store, nil)
 	server, err := NewLocalControlServer(host, 0)
 	if err != nil {
 		t.Fatal(err)

@@ -106,7 +106,7 @@ func TestInterruptedUpdateRestoresPreviousConnector(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
-	host := NewHost(store, server.Client())
+	host := newTestHost(store, server.Client())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := host.recoverInterruptedManagement(ctx); err != nil {
@@ -136,7 +136,7 @@ func TestInterruptedShellIsFinalized(t *testing.T) {
 	if err := store.saveManagementOutcome(managementOutcome{JobID: "job-shell", AttemptToken: "attempt-shell", Kind: protocol.HostWorkShell, Status: "running"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := NewHost(store, http.DefaultClient).recoverInterruptedManagement(t.Context()); err != nil {
+	if err := newTestHost(store, http.DefaultClient).recoverInterruptedManagement(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	outcome, found, err := store.loadManagementOutcome("job-shell")

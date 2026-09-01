@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,6 +25,9 @@ type Host struct {
 	clientMu           sync.RWMutex
 	client             *ControlClient
 	httpClient         *http.Client
+	logger             *slog.Logger
+	stateChanged       chan struct{}
+	accessMu           sync.Mutex
 	enrollmentMu       sync.Mutex
 	credentialsReady   chan struct{}
 	managementMu       sync.Mutex
@@ -31,14 +35,14 @@ type Host struct {
 	activeManagement   map[string]protocol.ActiveAttempt
 }
 
-func NewHost(store *Store, httpClient *http.Client) *Host {
-	if store == nil {
-		panic("connectorhost: store is required")
+func NewHost(store *Store, httpClient *http.Client, logger *slog.Logger) *Host {
+	if store == nil || logger == nil {
+		panic("connectorhost: store and logger are required")
 	}
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	host := &Host{store: store, httpClient: httpClient, credentialsReady: make(chan struct{}, 1), activeManagement: make(map[string]protocol.ActiveAttempt)}
+	host := &Host{store: store, httpClient: httpClient, logger: logger, credentialsReady: make(chan struct{}, 1), stateChanged: make(chan struct{}, 1), activeManagement: make(map[string]protocol.ActiveAttempt)}
 	host.installer = NewArtifactInstaller(store, httpClient)
 	host.supervisor = NewSupervisor(store, host)
 	return host
@@ -49,6 +53,7 @@ func (h *Host) Serve(ctx context.Context) error {
 }
 
 func (h *Host) ServeControl(ctx context.Context, controlPort int) error {
+	h.logger.Info("host service starting", "state_directory", h.store.Root(), "control_port", controlPort, "access_mode", h.store.AccessMode(), "version", Version)
 	h.CleanupStaging()
 	control, err := NewLocalControlServer(h, controlPort)
 	if err != nil {
@@ -85,6 +90,7 @@ func (h *Host) serveRemote(ctx context.Context) error {
 	h.clientMu.Lock()
 	h.client = client
 	h.clientMu.Unlock()
+	h.logger.Info("control plane configured", "host_id", h.store.HostID())
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
@@ -100,6 +106,9 @@ func (h *Host) serveRemote(ctx context.Context) error {
 		return err
 	}
 	heartbeat := 30 * time.Second
+	syncFailing := false
+	pollFailing := false
+	firstSync := true
 	for {
 		h.recoverManagementOutcomes(ctx)
 		h.flushManagementOutcomes(ctx)
@@ -113,15 +122,27 @@ func (h *Host) serveRemote(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			if !syncFailing {
+				h.logger.Warn("host synchronization failed")
+				syncFailing = true
+			}
 			if err := sleepContext(ctx, time.Second); err != nil {
 				return nil
 			}
 			continue
 		}
+		if syncFailing {
+			h.logger.Info("host synchronization recovered")
+			syncFailing = false
+		}
 		if response.HostID != "" && response.HostID != h.store.HostID() {
 			if err := h.store.SetCredentials(baseURL, credential, response.HostID); err != nil {
 				return err
 			}
+		}
+		if firstSync {
+			h.logger.Info("host synchronized", "host_id", response.HostID, "access_mode", h.store.AccessMode(), "connectors", len(h.store.Connectors()))
+			firstSync = false
 		}
 		h.retryConnectorStartup(ctx)
 		if response.HeartbeatSeconds >= 5 && response.HeartbeatSeconds <= 3600 {
@@ -131,19 +152,72 @@ func (h *Host) serveRemote(ctx context.Context) error {
 		if response.LongPollSeconds > 0 && response.LongPollSeconds <= 300 {
 			pollDeadline = time.Duration(response.LongPollSeconds+5) * time.Second
 		}
-		pollCtx, cancel := context.WithTimeout(ctx, pollDeadline)
-		work, pollErr := client.Poll(pollCtx, protocol.HostPollRequest{ActiveManagementAttempts: h.managementAttempts(), ActiveConnectorAttempts: h.activeAttempts()})
-		cancel()
+		work, pollErr, stateChanged := h.poll(ctx, client, pollDeadline)
+		if stateChanged {
+			continue
+		}
 		if pollErr != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
+			if !pollFailing {
+				h.logger.Warn("host work poll failed")
+				pollFailing = true
+			}
 			continue
+		}
+		if pollFailing {
+			h.logger.Info("host work polling recovered")
+			pollFailing = false
 		}
 		for _, item := range work.Work {
 			h.handleWork(ctx, item)
 		}
 	}
+}
+
+type hostPollResult struct {
+	response protocol.HostPollResponse
+	err      error
+}
+
+func (h *Host) poll(ctx context.Context, client *ControlClient, deadline time.Duration) (protocol.HostPollResponse, error, bool) {
+	pollCtx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+	result := make(chan hostPollResult, 1)
+	go func() {
+		response, err := client.Poll(pollCtx, protocol.HostPollRequest{ActiveManagementAttempts: h.managementAttempts(), ActiveConnectorAttempts: h.activeAttempts()})
+		result <- hostPollResult{response: response, err: err}
+	}()
+	select {
+	case completed := <-result:
+		return completed.response, completed.err, false
+	case <-h.stateChanged:
+		cancel()
+		<-result
+		return protocol.HostPollResponse{}, nil, true
+	case <-ctx.Done():
+		cancel()
+		<-result
+		return protocol.HostPollResponse{}, ctx.Err(), false
+	}
+}
+
+func (h *Host) SetAccessMode(mode AccessMode) error {
+	h.accessMu.Lock()
+	defer h.accessMu.Unlock()
+	previous := h.store.AccessMode()
+	if err := h.store.SetAccessMode(mode); err != nil {
+		return err
+	}
+	if previous != mode {
+		h.logger.Info("access mode changed", "previous", previous, "current", mode)
+		select {
+		case h.stateChanged <- struct{}{}:
+		default:
+		}
+	}
+	return nil
 }
 
 func (h *Host) waitForCredentials(ctx context.Context) (string, string, error) {
@@ -251,7 +325,9 @@ func (h *Host) handleWork(ctx context.Context, work protocol.HostWork) {
 		if work.ConnectorJob == nil {
 			return
 		}
+		h.logger.Info("connector command received", "connector_id", work.ConnectorID, "job_id", work.ConnectorJob.JobID, "kind", work.ConnectorJob.Kind, "operation", work.ConnectorJob.Operation)
 		if err := h.supervisor.Dispatch(work.ConnectorID, *work.ConnectorJob); err != nil {
+			h.logger.Warn("connector command dispatch failed", "connector_id", work.ConnectorID, "job_id", work.ConnectorJob.JobID)
 			completion := protocol.JobCompletion{AttemptToken: work.ConnectorJob.AttemptToken, Status: "error", Error: err.Error()}
 			completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 			_ = retryControl(completionCtx, func(ctx context.Context) error {
@@ -261,6 +337,7 @@ func (h *Host) handleWork(ctx context.Context, work protocol.HostWork) {
 		}
 	case protocol.HostWorkConnectorCancel:
 		if work.Cancel != nil {
+			h.logger.Info("connector command cancellation received", "connector_id", work.ConnectorID, "job_id", work.Cancel.JobID)
 			_ = h.supervisor.Cancel(work.ConnectorID, *work.Cancel)
 		}
 	default:
@@ -278,6 +355,7 @@ func (h *Host) handleWork(ctx context.Context, work protocol.HostWork) {
 }
 
 func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKind, connectorID string, job protocol.HostManagementJob) {
+	h.logger.Info("management work started", "kind", kind, "job_id", job.JobID, "connector_id", connectorID)
 	defer func() {
 		h.activeManagementMu.Lock()
 		delete(h.activeManagement, job.AttemptToken)
@@ -288,6 +366,11 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 	completion := protocol.HostManagementCompletion{JobID: job.JobID, AttemptToken: job.AttemptToken, Status: "error"}
 	sendCompletion := true
 	defer func() {
+		if completion.Status == "success" {
+			h.logger.Info("management work completed", "kind", kind, "job_id", job.JobID, "connector_id", connectorID, "status", completion.Status)
+		} else {
+			h.logger.Warn("management work completed", "kind", kind, "job_id", job.JobID, "connector_id", connectorID, "status", completion.Status)
+		}
 		if !sendCompletion {
 			return
 		}
@@ -781,6 +864,11 @@ func (h *Host) ConnectorEvent(ctx context.Context, connectorID, jobID string, ev
 	})
 }
 func (h *Host) ConnectorCompletion(ctx context.Context, connectorID, jobID string, completion protocol.JobCompletion) error {
+	if completion.Status == "success" {
+		h.logger.Info("connector command completed", "connector_id", connectorID, "job_id", jobID, "status", completion.Status)
+	} else {
+		h.logger.Warn("connector command completed", "connector_id", connectorID, "job_id", jobID, "status", completion.Status)
+	}
 	return retryControl(ctx, func(ctx context.Context) error {
 		return h.controlClient().ConnectorCompletion(ctx, connectorID, jobID, completion)
 	})

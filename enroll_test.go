@@ -42,7 +42,7 @@ func TestUnenrolledHostStaysAvailableAndEnrollsThroughLocalControl(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	host := NewHost(store, airlock.Client())
+	host := newTestHost(store, airlock.Client())
 	ctx, cancel := context.WithCancel(context.Background())
 	serveResult := make(chan error, 1)
 	go func() { serveResult <- host.ServeControl(ctx, 0) }()

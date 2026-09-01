@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	linuxServiceUnitName = "airlock-host.service"
-	linuxServiceUser     = "airlock-host"
-	linuxServiceGroup    = "airlock-host"
-	linuxControlPort     = 42927
+	nativeServiceSupported = true
+	linuxServiceUnitName   = "airlock-host.service"
+	linuxServiceUser       = "airlock-host"
+	linuxServiceGroup      = "airlock-host"
+	linuxControlPort       = 42927
 )
 
 type linuxServicePaths struct {

@@ -21,7 +21,7 @@ func TestLocalControlAuthenticatesAndCleansMatchingDescriptor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	host := NewHost(store, nil)
+	host := newTestHost(store, nil)
 	server, err := NewLocalControlServer(host, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -85,7 +85,7 @@ func TestLocalControlPreservesDescriptorWithDifferentNonce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := NewLocalControlServer(NewHost(store, nil), 0)
+	server, err := NewLocalControlServer(newTestHost(store, nil), 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ func TestLocalControlRejectsUnknownJSONFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := NewLocalControlServer(NewHost(store, nil), 0)
+	server, err := NewLocalControlServer(newTestHost(store, nil), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

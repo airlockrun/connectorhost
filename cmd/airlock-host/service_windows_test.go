@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +20,44 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 )
+
+type recordingWindowsEventLogger struct {
+	info     []string
+	warnings []string
+	errors   []string
+}
+
+func (l *recordingWindowsEventLogger) Info(_ uint32, message string) error {
+	l.info = append(l.info, message)
+	return nil
+}
+
+func (l *recordingWindowsEventLogger) Warning(_ uint32, message string) error {
+	l.warnings = append(l.warnings, message)
+	return nil
+}
+
+func (l *recordingWindowsEventLogger) Error(_ uint32, message string) error {
+	l.errors = append(l.errors, message)
+	return nil
+}
+
+func TestWindowsEventLogHandlerPreservesSeverity(t *testing.T) {
+	recorder := &recordingWindowsEventLogger{}
+	logger := slog.New(&windowsEventLogHandler{logger: recorder})
+	logger.Info("started", "version", "test")
+	logger.Warn("sync failed")
+	logger.Error("stopped")
+	if len(recorder.info) != 1 || !strings.Contains(recorder.info[0], "version=test") {
+		t.Fatalf("info events = %q", recorder.info)
+	}
+	if len(recorder.warnings) != 1 || !strings.Contains(recorder.warnings[0], "sync failed") {
+		t.Fatalf("warning events = %q", recorder.warnings)
+	}
+	if len(recorder.errors) != 1 || !strings.Contains(recorder.errors[0], "stopped") {
+		t.Fatalf("error events = %q", recorder.errors)
+	}
+}
 
 func TestWindowsServiceArguments(t *testing.T) {
 	stateDirectory := `C:\ProgramData\Airlock\Host`
@@ -203,7 +243,7 @@ func TestWindowsConnectorHostFilesAllowElevatedCLI(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	server, err := connectorhost.NewLocalControlServer(connectorhost.NewHost(store, nil), 0)
+	server, err := connectorhost.NewLocalControlServer(connectorhost.NewHost(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil))), 0)
 	if err != nil {
 		t.Fatal(err)
 	}

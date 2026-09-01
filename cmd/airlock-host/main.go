@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -78,7 +79,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return enrollCommand(*stateDirectory, args[1:], stdin, stdout, stderr)
 	}
 	if *stateDirectory == "" {
-		root, err := defaultStateDirectory()
+		root, err := resolveStateDirectory(args[0], func() (string, error) {
+			if !nativeServiceSupported {
+				return defaultStateDirectory()
+			}
+			manager, err := newNativeServiceManager()
+			if err != nil {
+				return "", err
+			}
+			return manager.StateDirectory(), nil
+		}, defaultStateDirectory)
 		if err != nil {
 			return err
 		}
@@ -213,10 +223,18 @@ func accessCommand(root string, args []string, stdout io.Writer) error {
 		}
 		return controlFirst(root, false,
 			func(ctx context.Context, client *connectorhost.LocalControlClient) error {
-				return client.SetAccess(ctx, mode)
+				if err := client.SetAccess(ctx, mode); err != nil {
+					return err
+				}
+				_, err := fmt.Fprintf(stdout, "access mode: %s\n", mode)
+				return err
 			},
-			func(_ context.Context, _ *connectorhost.Host, store *connectorhost.Store) error {
-				return store.SetAccessMode(mode)
+			func(_ context.Context, host *connectorhost.Host, _ *connectorhost.Store) error {
+				if err := host.SetAccessMode(mode); err != nil {
+					return err
+				}
+				_, err := fmt.Fprintf(stdout, "access mode: %s\n", mode)
+				return err
 			})
 	}
 	return errors.New("airlock-host: access requires get or set <full|update_only|none>")
@@ -373,7 +391,7 @@ func controlFirst(root string, readOnly bool, remote func(context.Context, *conn
 	defer cancel()
 	var controlErr error
 	runDirect := func(store *connectorhost.Store) error {
-		host := connectorhost.NewHost(store, nil)
+		host := connectorhost.NewHost(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
 		host.CleanupStaging()
 		err := direct(ctx, host, store)
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -482,13 +500,24 @@ func defaultStateDirectory() (string, error) {
 	return filepath.Join(root, "airlock", "host"), nil
 }
 
+func resolveStateDirectory(command string, managed, standalone func() (string, error)) (string, error) {
+	if command == "access" || command == "connector" {
+		return managed()
+	}
+	return standalone()
+}
+
 func runHost(ctx context.Context, stateDirectory string, controlPort int) error {
+	return runHostWithLogger(ctx, stateDirectory, controlPort, slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+}
+
+func runHostWithLogger(ctx context.Context, stateDirectory string, controlPort int, logger *slog.Logger) error {
 	store, err := connectorhost.OpenStore(stateDirectory)
 	if err != nil {
 		return err
 	}
 	defer store.Close()
-	return connectorhost.NewHost(store, nil).ServeControl(ctx, controlPort)
+	return connectorhost.NewHost(store, nil, logger).ServeControl(ctx, controlPort)
 }
 
 func enrollHost(ctx context.Context, stateDirectory, airlockURL string, mode connectorhost.AccessMode, output io.Writer) error {

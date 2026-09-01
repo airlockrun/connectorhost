@@ -3,12 +3,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"debug/pe"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -26,6 +28,7 @@ import (
 )
 
 const (
+	nativeServiceSupported         = true
 	windowsServiceMarker           = "__windows_service"
 	windowsServiceControlPort      = 42927
 	windowsServiceOperationTimeout = 30 * time.Second
@@ -50,6 +53,64 @@ type windowsServiceHandler struct {
 	ready           func(context.Context, string) error
 	resultMu        sync.Mutex
 	result          error
+}
+
+type windowsEventLogger interface {
+	Info(uint32, string) error
+	Warning(uint32, string) error
+	Error(uint32, string) error
+}
+
+type windowsEventLogHandler struct {
+	logger  windowsEventLogger
+	options []windowsEventLogOption
+}
+
+type windowsEventLogOption struct {
+	attributes []slog.Attr
+	group      string
+}
+
+func (h *windowsEventLogHandler) Enabled(_ context.Context, level slog.Level) bool {
+	return level >= slog.LevelInfo
+}
+
+func (h *windowsEventLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	var output bytes.Buffer
+	var handler slog.Handler = slog.NewTextHandler(&output, nil)
+	for _, option := range h.options {
+		if option.group != "" {
+			handler = handler.WithGroup(option.group)
+		} else {
+			handler = handler.WithAttrs(option.attributes)
+		}
+	}
+	if err := handler.Handle(ctx, record); err != nil {
+		return err
+	}
+	message := strings.TrimSpace(output.String())
+	if record.Level >= slog.LevelError {
+		return h.logger.Error(1, message)
+	}
+	if record.Level >= slog.LevelWarn {
+		return h.logger.Warning(1, message)
+	}
+	return h.logger.Info(1, message)
+}
+
+func (h *windowsEventLogHandler) WithAttrs(attributes []slog.Attr) slog.Handler {
+	clone := *h
+	clone.options = append(append([]windowsEventLogOption(nil), h.options...), windowsEventLogOption{attributes: append([]slog.Attr(nil), attributes...)})
+	return &clone
+}
+
+func (h *windowsEventLogHandler) WithGroup(name string) slog.Handler {
+	if name == "" {
+		return h
+	}
+	clone := *h
+	clone.options = append(append([]windowsEventLogOption(nil), h.options...), windowsEventLogOption{group: name})
+	return &clone
 }
 
 func newNativeServiceManager() (nativeServiceManager, error) {
@@ -80,12 +141,20 @@ func runNativeService(args []string) (bool, error) {
 	if err := validateWindowsServiceArguments(args, serviceManager.stateDirectory); err != nil {
 		return true, err
 	}
+	eventLogger, err := eventlog.Open(nativeServiceName)
+	if err != nil {
+		return true, fmt.Errorf("airlock-host: open Windows event log: %w", err)
+	}
+	defer eventLogger.Close()
+	logger := slog.New(&windowsEventLogHandler{logger: eventLogger})
 	handler := &windowsServiceHandler{
 		stateDirectory:  serviceManager.stateDirectory,
 		controlPort:     windowsServiceControlPort,
 		shutdownTimeout: windowsServiceShutdownTimeout,
-		run:             runHost,
-		ready:           windowsHostReady,
+		run: func(ctx context.Context, stateDirectory string, controlPort int) error {
+			return runHostWithLogger(ctx, stateDirectory, controlPort, logger)
+		},
+		ready: windowsHostReady,
 	}
 	if err := svc.Run(nativeServiceName, handler); err != nil {
 		return true, fmt.Errorf("airlock-host: run Windows service: %w", err)
