@@ -253,13 +253,17 @@ func TestArtifactStagingAndChildSupervision(t *testing.T) {
 	digest := sha256.Sum256(body)
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(body) }))
 	defer server.Close()
+	filename := "helper"
+	if runtime.GOOS == "windows" {
+		filename += ".exe"
+	}
 	store, err := OpenStore(filepath.Join(t.TempDir(), "instance"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
 	installer := NewArtifactInstaller(store, server.Client())
-	record, err := installer.Stage(context.Background(), protocol.ConnectorArtifactInput{InstallationID: "helper-1", URL: server.URL + "/connector", Filename: "helper", SHA256: hex.EncodeToString(digest[:]), SizeBytes: int64(len(body))}, json.RawMessage(`{}`))
+	record, err := installer.Stage(context.Background(), protocol.ConnectorArtifactInput{InstallationID: "helper-1", URL: server.URL + "/connector", Filename: filename, SHA256: hex.EncodeToString(digest[:]), SizeBytes: int64(len(body))}, json.RawMessage(`{}`))
 	if err != nil {
 		t.Fatal(err)
 	}

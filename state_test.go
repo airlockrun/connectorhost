@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/airlockrun/agentsdk/connector/protocol"
@@ -43,7 +44,7 @@ func TestStoreDefaultsFullPersistsAndLocks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("state mode = %o", info.Mode().Perm())
 	}
 }
