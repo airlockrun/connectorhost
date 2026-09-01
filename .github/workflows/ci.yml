@@ -107,7 +107,10 @@ jobs:
           sudo systemctl disable --now airlock-host.service
           sudo dpkg --install "${packages[0]}"
           [[ "$(sudo airlock-host service status)" == stopped ]]
-          ! systemctl is-enabled --quiet airlock-host.service
+          if systemctl is-enabled --quiet airlock-host.service; then
+            echo "::error::stopped and disabled service was re-enabled during upgrade"
+            exit 1
+          fi
 
           sudo systemctl enable airlock-host.service
           sudo airlock-host service start
