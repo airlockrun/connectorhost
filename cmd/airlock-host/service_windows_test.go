@@ -167,10 +167,10 @@ func TestWindowsServiceStateACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	serviceSID := user.User.Sid
-	if err := setWindowsServicePathACL(filepath.Dir(root), true, serviceSID, windows.GENERIC_ALL); err != nil {
+	if err := setWindowsServicePathACL(filepath.Dir(root), true, serviceSID, windowsFileAllAccess); err != nil {
 		t.Fatal(err)
 	}
-	if err := setWindowsServicePathACL(root, true, serviceSID, windows.GENERIC_ALL); err != nil {
+	if err := setWindowsServicePathACL(root, true, serviceSID, windowsFileAllAccess); err != nil {
 		t.Fatal(err)
 	}
 	if err := provisionWindowsServiceState(root, serviceSID); err != nil {
@@ -185,14 +185,14 @@ func TestWindowsServiceStateACL(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertWindowsProtectedACL(t, root, map[string]windows.ACCESS_MASK{
-		serviceSID.String():     windows.GENERIC_ALL,
-		administrators.String(): windows.GENERIC_ALL,
-		system.String():         windows.GENERIC_ALL,
+		serviceSID.String():     windowsFileAllAccess,
+		administrators.String(): windowsFileAllAccess,
+		system.String():         windowsFileAllAccess,
 	}, true)
 	assertWindowsProtectedACL(t, file, map[string]windows.ACCESS_MASK{
-		serviceSID.String():     windows.GENERIC_ALL,
-		administrators.String(): windows.GENERIC_ALL,
-		system.String():         windows.GENERIC_ALL,
+		serviceSID.String():     windowsFileAllAccess,
+		administrators.String(): windowsFileAllAccess,
+		system.String():         windowsFileAllAccess,
 	}, false)
 }
 
@@ -225,7 +225,7 @@ func TestWindowsConnectorHostFilesAllowElevatedCLI(t *testing.T) {
 	}
 	want := make(map[string]windows.ACCESS_MASK)
 	for _, sid := range []*windows.SID{user.User.Sid, administrators, system} {
-		want[sid.String()] = windows.GENERIC_ALL
+		want[sid.String()] = windowsFileAllAccess
 	}
 	assertWindowsProtectedACL(t, root, want, true)
 	assertWindowsProtectedACL(t, filepath.Join(root, "host.json"), want, false)
@@ -298,9 +298,9 @@ func TestWindowsSCMServiceLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantStateACL := map[string]windows.ACCESS_MASK{
-		serviceSID.String():     windows.GENERIC_ALL,
-		administrators.String(): windows.GENERIC_ALL,
-		system.String():         windows.GENERIC_ALL,
+		serviceSID.String():     windowsFileAllAccess,
+		administrators.String(): windowsFileAllAccess,
+		system.String():         windowsFileAllAccess,
 	}
 	assertWindowsProtectedACL(t, filepath.Dir(manager.stateDirectory), wantStateACL, true)
 	assertWindowsProtectedACL(t, manager.stateDirectory, wantStateACL, true)

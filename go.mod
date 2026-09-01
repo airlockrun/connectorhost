@@ -1,6 +1,6 @@
 module github.com/airlockrun/connectorhost
 
-go 1.26.0
+go 1.26.4
 
 require (
 	github.com/airlockrun/agentsdk v0.6.0-rc.6

@@ -16,6 +16,8 @@ import (
 
 var moveFileEx = syscall.NewLazyDLL("kernel32.dll").NewProc("MoveFileExW")
 
+const windowsFileAllAccess windows.ACCESS_MASK = windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff
+
 func replaceFile(from, to string) error {
 	fromPointer, err := syscall.UTF16PtrFromString(from)
 	if err != nil {
@@ -80,7 +82,7 @@ func setCurrentUserACL(path string, directory bool) error {
 			continue
 		}
 		entries = append(entries, windows.EXPLICIT_ACCESS{
-			AccessPermissions: windows.GENERIC_ALL,
+			AccessPermissions: windowsFileAllAccess,
 			AccessMode:        windows.SET_ACCESS,
 			Inheritance:       inheritance,
 			Trustee: windows.TRUSTEE{

@@ -32,6 +32,8 @@ const (
 	windowsServiceShutdownTimeout  = 25 * time.Second
 	windowsServicePollInterval     = 200 * time.Millisecond
 	windowsServiceDescription      = "Runs the Airlock connector host."
+	windowsFileAllAccess           = windows.ACCESS_MASK(windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff)
+	windowsFileReadExecute         = windows.ACCESS_MASK(windows.FILE_GENERIC_READ | windows.FILE_GENERIC_EXECUTE)
 )
 
 type windowsNativeServiceManager struct {
@@ -649,7 +651,7 @@ func provisionWindowsServiceState(root string, serviceSID *windows.SID) error {
 	if err := rejectWindowsReparsePoint(parent); err != nil {
 		return err
 	}
-	if err := setWindowsServicePathACL(parent, true, serviceSID, windows.GENERIC_ALL); err != nil {
+	if err := setWindowsServicePathACL(parent, true, serviceSID, windowsFileAllAccess); err != nil {
 		return err
 	}
 	if err := validateExistingWindowsDirectoryOwner(root); err != nil {
@@ -665,7 +667,7 @@ func provisionWindowsServiceState(root string, serviceSID *windows.SID) error {
 		if err := rejectWindowsReparsePoint(path); err != nil {
 			return err
 		}
-		return setWindowsServicePathACL(path, entry.IsDir(), serviceSID, windows.GENERIC_ALL)
+		return setWindowsServicePathACL(path, entry.IsDir(), serviceSID, windowsFileAllAccess)
 	})
 }
 
@@ -683,11 +685,11 @@ func installWindowsExecutable(source, target string, serviceSID *windows.SID) er
 	if err := rejectWindowsReparsePoint(directory); err != nil {
 		return err
 	}
-	if err := setWindowsServicePathACL(directory, true, serviceSID, windows.GENERIC_READ|windows.GENERIC_EXECUTE); err != nil {
+	if err := setWindowsServicePathACL(directory, true, serviceSID, windowsFileReadExecute); err != nil {
 		return err
 	}
 	if strings.EqualFold(filepath.Clean(source), filepath.Clean(target)) {
-		return setWindowsServicePathACL(target, false, serviceSID, windows.GENERIC_READ|windows.GENERIC_EXECUTE)
+		return setWindowsServicePathACL(target, false, serviceSID, windowsFileReadExecute)
 	}
 	if _, err := os.Stat(target); err == nil {
 		equal, err := filesEqual(source, target)
@@ -695,7 +697,7 @@ func installWindowsExecutable(source, target string, serviceSID *windows.SID) er
 			return err
 		}
 		if equal {
-			return setWindowsServicePathACL(target, false, serviceSID, windows.GENERIC_READ|windows.GENERIC_EXECUTE)
+			return setWindowsServicePathACL(target, false, serviceSID, windowsFileReadExecute)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -726,7 +728,7 @@ func installWindowsExecutable(source, target string, serviceSID *windows.SID) er
 	if err := validateExecutable(temporaryPath); err != nil {
 		return err
 	}
-	if err := setWindowsServicePathACL(temporaryPath, false, serviceSID, windows.GENERIC_READ|windows.GENERIC_EXECUTE); err != nil {
+	if err := setWindowsServicePathACL(temporaryPath, false, serviceSID, windowsFileReadExecute); err != nil {
 		return err
 	}
 	from, err := windows.UTF16PtrFromString(temporaryPath)
@@ -740,7 +742,7 @@ func installWindowsExecutable(source, target string, serviceSID *windows.SID) er
 	if err := windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
 		return err
 	}
-	return setWindowsServicePathACL(target, false, serviceSID, windows.GENERIC_READ|windows.GENERIC_EXECUTE)
+	return setWindowsServicePathACL(target, false, serviceSID, windowsFileReadExecute)
 }
 
 func windowsExecutableNeedsInstall(source, target string) (bool, error) {
@@ -817,8 +819,8 @@ func setWindowsServicePathACL(path string, directory bool, serviceSID *windows.S
 	}
 	entries := []windows.EXPLICIT_ACCESS{
 		windowsExplicitAccess(serviceSID, serviceAccess, inheritance),
-		windowsExplicitAccess(administrators, windows.GENERIC_ALL, inheritance),
-		windowsExplicitAccess(system, windows.GENERIC_ALL, inheritance),
+		windowsExplicitAccess(administrators, windowsFileAllAccess, inheritance),
+		windowsExplicitAccess(system, windowsFileAllAccess, inheritance),
 	}
 	acl, err := windows.ACLFromEntries(entries, nil)
 	if err != nil {
