@@ -1,3 +1,3 @@
 package connectorhost
 
-const Version = "0.1.0-rc.3"
+const Version = "0.1.0-rc.4"

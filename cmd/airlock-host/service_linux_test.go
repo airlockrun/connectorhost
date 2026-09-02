@@ -26,7 +26,7 @@ func (err linuxTestExitError) ExitCode() int {
 	return int(err)
 }
 
-func TestLinuxSystemdUnit(t *testing.T) {
+func TestLinuxSystemdUnits(t *testing.T) {
 	manager := &linuxServiceManager{paths: linuxServicePaths{
 		executable:     "/usr/local/bin/airlock-host",
 		stateDirectory: "/var/lib/airlock-host",
@@ -56,6 +56,60 @@ WantedBy=multi-user.target
 	line := `ExecStart="/opt/Airlock Host/$$channel%%/airlock\"host" "--state-dir" "/var/lib/Airlock Host" "serve" "--control-port" "42927"`
 	if !strings.Contains(manager.systemdUnit(), line+"\n") {
 		t.Fatalf("systemd unit does not safely quote ExecStart:\n%s", manager.systemdUnit())
+	}
+
+	manager.scope = nativeServiceUser
+	manager.paths.executable = "/home/alice/.local/bin/airlock-host"
+	manager.paths.stateDirectory = "/home/alice/.config/airlock/host"
+	want = `[Unit]
+Description=Airlock Connector Host
+
+[Service]
+Type=simple
+UMask=0077
+ExecStart="/home/alice/.local/bin/airlock-host" "--state-dir" "/home/alice/.config/airlock/host" "serve" "--control-port" "0"
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=default.target
+`
+	if got := manager.systemdUnit(); got != want {
+		t.Fatalf("user systemd unit:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestLinuxUserServicePaths(t *testing.T) {
+	paths, err := linuxUserServicePaths("/home/alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := linuxServicePaths{
+		executable:     "/home/alice/.local/bin/airlock-host",
+		stateDirectory: "/home/alice/.config/airlock/host",
+		unitFile:       "/home/alice/.config/systemd/user/airlock-host.service",
+	}
+	if paths != want {
+		t.Fatalf("paths = %#v, want %#v", paths, want)
+	}
+	if _, err := linuxUserServicePaths("relative"); err == nil {
+		t.Fatal("relative home directory accepted")
+	}
+}
+
+func TestLinuxSystemServiceManagerPaths(t *testing.T) {
+	managerValue, err := newNativeServiceManager(nativeServiceSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := managerValue.(*linuxServiceManager)
+	want := linuxServicePaths{
+		executable:     "/usr/local/bin/airlock-host",
+		stateDirectory: "/var/lib/airlock-host",
+		unitFile:       "/etc/systemd/system/airlock-host.service",
+	}
+	if manager.scope != nativeServiceSystem || manager.paths != want {
+		t.Fatalf("manager = %#v, want paths %#v", manager, want)
 	}
 }
 
@@ -209,6 +263,101 @@ func TestLinuxInstallRequiresRootBeforeInspectingExecutable(t *testing.T) {
 	}
 }
 
+func TestLinuxUserInstallIsUnprivileged(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "current-airlock-host")
+	if err := os.WriteFile(sourcePath, []byte("user executable"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var calls []linuxCommandCall
+	manager := newTestLinuxUserServiceManager(root, sourcePath, func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, linuxCommandCall{name: name, args: append([]string(nil), args...)})
+		if name == "systemctl" && reflect.DeepEqual(args, []string{"--user", "show-environment"}) {
+			return []byte("HOME=" + filepath.Join(root, "home") + "\n"), nil
+		}
+		return nil, nil
+	})
+	if err := manager.Install(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls := []linuxCommandCall{
+		{name: "systemctl", args: []string{"--user", "show-environment"}},
+		{name: "systemctl", args: []string{"--user", "enable", linuxServiceUnitName}},
+		{name: "systemctl", args: []string{"--user", "daemon-reload"}},
+	}
+	if !reflect.DeepEqual(calls, wantCalls) {
+		t.Fatalf("commands = %#v, want %#v", calls, wantCalls)
+	}
+	stateInfo, err := os.Stat(manager.paths.stateDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("state directory mode = %o", stateInfo.Mode().Perm())
+	}
+	installed, err := os.ReadFile(manager.paths.executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(installed) != "user executable" {
+		t.Fatalf("installed executable = %q", installed)
+	}
+	unit, err := os.ReadFile(manager.paths.unitFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(unit) != manager.systemdUnit() {
+		t.Fatalf("installed unit:\n%s\nwant:\n%s", unit, manager.systemdUnit())
+	}
+}
+
+func TestLinuxUserInstallRejectsDifferentManagerConfigDirectory(t *testing.T) {
+	root := t.TempDir()
+	managerHome := filepath.Join(root, "home")
+	manager := newTestLinuxUserServiceManager(root, "/not-inspected", func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "systemctl" && reflect.DeepEqual(args, []string{"--user", "show-environment"}) {
+			return []byte("HOME=" + managerHome + "\nXDG_CONFIG_HOME=/different/config\n"), nil
+		}
+		return nil, errors.New("unexpected command")
+	})
+	err := manager.Install(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("Install error = %v", err)
+	}
+}
+
+func TestLinuxUserInstallRejectsDifferentManagerHome(t *testing.T) {
+	root := t.TempDir()
+	manager := newTestLinuxUserServiceManager(root, "/not-inspected", func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name == "systemctl" && reflect.DeepEqual(args, []string{"--user", "show-environment"}) {
+			return []byte("HOME=/different/home\n"), nil
+		}
+		return nil, errors.New("unexpected command")
+	})
+	err := manager.Install(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "HOME does not match") {
+		t.Fatalf("Install error = %v", err)
+	}
+}
+
+func TestLinuxUserInstallRejectsRootBeforeInspectingExecutable(t *testing.T) {
+	called := false
+	manager := &linuxServiceManager{
+		scope:        nativeServiceUser,
+		effectiveUID: func() int { return 0 },
+		currentExe: func() (string, error) {
+			called = true
+			return "", errors.New("unexpected")
+		},
+	}
+	if err := manager.Install(t.Context()); err == nil || !strings.Contains(err.Error(), "cannot be used as root") {
+		t.Fatalf("Install error = %v", err)
+	}
+	if called {
+		t.Fatal("current executable inspected before root validation")
+	}
+}
+
 func TestLinuxLifecycleCommandsAndUninstallPreservesData(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "source")
@@ -286,6 +435,73 @@ func TestLinuxLifecycleCommandsAndUninstallPreservesData(t *testing.T) {
 	}
 }
 
+func TestLinuxUserLifecycleUsesUserManagerAndPreservesData(t *testing.T) {
+	root := t.TempDir()
+	manager := newTestLinuxUserServiceManager(root, filepath.Join(root, "source"), nil)
+	if err := os.MkdirAll(filepath.Dir(manager.paths.unitFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.paths.unitFile, []byte("unit"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(manager.paths.stateDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	statePath := filepath.Join(manager.paths.stateDirectory, "state")
+	if err := os.WriteFile(statePath, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(manager.paths.executable), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.paths.executable, []byte("keep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	activeState := "inactive"
+	var calls []linuxCommandCall
+	manager.runCommand = func(_ context.Context, name string, args ...string) ([]byte, error) {
+		calls = append(calls, linuxCommandCall{name: name, args: append([]string(nil), args...)})
+		if name != "systemctl" || len(args) < 2 || args[0] != "--user" {
+			return nil, errors.New("unexpected command")
+		}
+		switch args[1] {
+		case "show":
+			pid := "0"
+			if activeState == "active" {
+				pid = "123"
+			}
+			return []byte("LoadState=loaded\nActiveState=" + activeState + "\nSubState=running\nFreezerState=running\nMainPID=" + pid + "\n"), nil
+		case "start":
+			activeState = "active"
+		case "stop":
+			activeState = "inactive"
+		}
+		return nil, nil
+	}
+
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Stop(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Uninstall(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range calls {
+		if call.name != "systemctl" || len(call.args) == 0 || call.args[0] != "--user" {
+			t.Fatalf("lifecycle command did not use the user manager: %#v", call)
+		}
+	}
+	if body, err := os.ReadFile(manager.paths.executable); err != nil || string(body) != "keep" {
+		t.Fatalf("executable changed: body %q, error %v", body, err)
+	}
+	if body, err := os.ReadFile(statePath); err != nil || string(body) != "keep" {
+		t.Fatalf("state changed: body %q, error %v", body, err)
+	}
+}
+
 func TestLinuxCommandsAreBounded(t *testing.T) {
 	root := t.TempDir()
 	manager := newTestLinuxServiceManager(root, filepath.Join(root, "source"), func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
@@ -322,6 +538,19 @@ func newTestLinuxServiceManager(root, sourcePath string, runner linuxCommandRunn
 		passwdFile:     filepath.Join(root, "passwd"),
 		commandTimeout: time.Second,
 	}
+}
+
+func newTestLinuxUserServiceManager(root, sourcePath string, runner linuxCommandRunner) *linuxServiceManager {
+	manager := newTestLinuxServiceManager(root, sourcePath, runner)
+	manager.scope = nativeServiceUser
+	manager.paths = linuxServicePaths{
+		executable:     filepath.Join(root, "home", ".local", "bin", "airlock-host"),
+		stateDirectory: filepath.Join(root, "home", ".config", "airlock", "host"),
+		unitFile:       filepath.Join(root, "home", ".config", "systemd", "user", linuxServiceUnitName),
+	}
+	manager.userHomeDirectory = filepath.Join(root, "home")
+	manager.effectiveUID = func() int { return 1000 }
+	return manager
 }
 
 func managerStateDirectory(root string) string {

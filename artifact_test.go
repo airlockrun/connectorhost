@@ -78,6 +78,20 @@ func TestManifestInspectionTerminatesInheritedPipeDescendant(t *testing.T) {
 	waitForStoppedTestProcess(t, waitForTestPID(t, pidPath))
 }
 
+func TestManifestInspectionAcceptsSettingJSONName(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := inspectManifest(t.Context(), executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.Settings) != 1 || manifest.Settings[0].JSONName != "broker.url" {
+		t.Fatalf("manifest settings = %+v", manifest.Settings)
+	}
+}
+
 func TestManifestInspectionTimeoutTerminatesProcessTree(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {

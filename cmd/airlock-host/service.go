@@ -18,6 +18,13 @@ const (
 	nativeServiceDisplayName = "Airlock Connector Host"
 )
 
+type nativeServiceScope uint8
+
+const (
+	nativeServiceSystem nativeServiceScope = iota
+	nativeServiceUser
+)
+
 type nativeServiceState string
 
 const (
@@ -46,11 +53,13 @@ type nativeServiceManager interface {
 	StateDirectory() string
 }
 
-func serviceCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+type nativeServiceManagerFactory func(nativeServiceScope) (nativeServiceManager, error)
+
+func serviceCommand(scope nativeServiceScope, managerFactory nativeServiceManagerFactory, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 {
 		return serviceUsageError()
 	}
-	manager, err := newNativeServiceManager()
+	manager, err := managerFactory(scope)
 	if err != nil {
 		return err
 	}
@@ -64,10 +73,11 @@ func serviceCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) er
 		if err := manager.Install(ctx); err != nil {
 			return err
 		}
-		_, err := fmt.Fprintln(stdout, `installed
-Next:
-  airlock-host service start
-  airlock-host enroll --airlock https://airlock.example`)
+		nextScope := ""
+		if scope == nativeServiceUser {
+			nextScope = "--user "
+		}
+		_, err := fmt.Fprintf(stdout, "installed\nNext:\n  airlock-host %sservice start\n  airlock-host %senroll --airlock https://airlock.example\n", nextScope, nextScope)
 		return err
 	case "start":
 		if len(args) != 1 {
@@ -120,18 +130,21 @@ Next:
 			}
 			return err
 		}
-		return enrollManagedService(ctx, manager, airlockURL, mode, stdout)
+		return enrollManagedService(ctx, scope, manager, airlockURL, mode, stdout)
 	default:
 		return serviceUsageError()
 	}
 }
 
-func enrollManagedService(ctx context.Context, manager nativeServiceManager, airlockURL string, mode connectorhost.AccessMode, stdout io.Writer) error {
+func enrollManagedService(ctx context.Context, scope nativeServiceScope, manager nativeServiceManager, airlockURL string, mode connectorhost.AccessMode, stdout io.Writer) error {
 	status, err := manager.Status(ctx)
 	if err != nil {
 		return err
 	}
 	if status.State == serviceNotInstalled {
+		if scope == nativeServiceUser {
+			return errors.New("airlock-host: per-user managed service is not installed; run 'airlock-host --user service install'")
+		}
 		return errors.New("airlock-host: managed service is not installed; install the Linux package or run 'airlock-host service install'")
 	}
 	if status.State == servicePaused {
@@ -164,5 +177,5 @@ func requireUnenrolledState(stateDirectory string) error {
 }
 
 func serviceUsageError() error {
-	return errors.New("usage: airlock-host service <install|start|stop|status|uninstall|enroll>")
+	return errors.New("usage: airlock-host [--user] service <install|start|stop|status|uninstall|enroll>")
 }

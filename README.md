@@ -19,24 +19,25 @@ trusted Airlock builds and protect the host account as one trust domain.
 ## CLI
 
 ```text
-airlock-host enroll --airlock https://airlock.example [--mode full|update_only|none]
-airlock-host [--state-dir DIR] access get
-airlock-host [--state-dir DIR] access set full|update_only|none
-airlock-host [--state-dir DIR] connector list
-airlock-host [--state-dir DIR] connector status [ID] [--json]
-airlock-host [--state-dir DIR] connector install ./connector [--name NAME] [--settings settings.json] [--sha256 HEX]
-airlock-host [--state-dir DIR] connector update ID ./connector [--settings settings.json] [--sha256 HEX]
-airlock-host [--state-dir DIR] connector rollback ID
-airlock-host [--state-dir DIR] connector remove ID
-airlock-host service install|start|stop|status|uninstall
-airlock-host service enroll --airlock https://airlock.example [--mode full|update_only|none]
+airlock-host [--user] enroll --airlock https://airlock.example [--mode full|update_only|none]
+airlock-host [--user | --state-dir DIR] access get
+airlock-host [--user | --state-dir DIR] access set full|update_only|none
+airlock-host [--user | --state-dir DIR] connector list
+airlock-host [--user | --state-dir DIR] connector status [ID] [--json]
+airlock-host [--user | --state-dir DIR] connector install ./connector [--name NAME] [--settings settings.json] [--sha256 HEX]
+airlock-host [--user | --state-dir DIR] connector update ID ./connector [--settings settings.json] [--sha256 HEX]
+airlock-host [--user | --state-dir DIR] connector rollback ID
+airlock-host [--user | --state-dir DIR] connector remove ID
+airlock-host [--user] service install|start|stop|status|uninstall
+airlock-host [--user] service enroll --airlock https://airlock.example [--mode full|update_only|none]
 airlock-host --state-dir DIR enroll --airlock https://airlock.example [--mode full|update_only|none]
 airlock-host --state-dir DIR serve [--control-port PORT]
 ```
 
-Without `--state-dir`, `enroll` targets the managed machine service and starts it
-if necessary. Interactive enrollment asks which remote management mode to use.
-Pass `--mode` explicitly for scripts and other noninteractive input.
+Without `--state-dir` or `--user`, `enroll` targets the managed machine service
+and starts it if necessary. Interactive enrollment asks which remote management
+mode to use. Pass `--mode` explicitly for scripts and other noninteractive
+input.
 
 Each state root has an exclusive process lock. Run multiple host instances with
 different `--state-dir` values and control ports. The serving process listens on
@@ -64,12 +65,12 @@ compact heartbeat only after its first inventory upsert is acknowledged.
 - `none` rejects all remote management.
 - Ordinary connector jobs and cancellations are independent of management mode.
 
-Full shell work has all privileges of the host OS account. Managed installations
-use the dedicated `airlock-host` account on Linux and the `AirlockHost` virtual
-service account on Windows. Shell execution uses an explicit executable and
-arguments, enforces the job deadline, terminates the process tree through a
-guarded process group or Windows Job Object, and bounds aggregate stdout and
-stderr.
+Full shell work has all privileges of the host OS account. Machine-managed
+installations use the dedicated `airlock-host` account on Linux and the
+`AirlockHost` virtual service account on Windows. Linux user services run as the
+login user. Shell execution uses an explicit executable and arguments, enforces
+the job deadline, terminates the process tree through a guarded process group or
+Windows Job Object, and bounds aggregate stdout and stderr.
 
 ## Artifacts
 
@@ -143,10 +144,40 @@ sudo airlock-host service start
 sudo airlock-host enroll --airlock https://airlock.example
 ```
 
+On Linux, a login user can install an independent systemd user service without
+root access or a package. The global `--user` flag precedes the command and
+selects the same user service for lifecycle, enrollment, access, and connector
+operations:
+
+```sh
+./airlock-host --user service install
+airlock-host --user service start
+airlock-host --user enroll --airlock https://airlock.example
+airlock-host --user connector list
+```
+
+The user service installs its executable at `~/.local/bin/airlock-host`, stores
+its independent identity and connector inventory under `~/.config/airlock/host`,
+and installs its unit under `~/.config/systemd/user`. Custom
+`XDG_CONFIG_HOME` values are not supported for managed user services because
+the CLI and the running systemd user manager must use the same unit search path.
+The service uses a kernel-assigned local control port, so it can run alongside
+the machine service and other users' services. It runs connectors with the
+login user's permissions.
+
+An enabled user service starts with that user's systemd manager. Keeping it
+running after logout or starting it before login requires the administrator to
+enable lingering separately, for example with `loginctl enable-linger`; Airlock
+does not change that account-wide setting. Linux package upgrades manage only
+the machine service. Refresh a user service's private executable by rerunning
+`/usr/bin/airlock-host --user service install`, then restart the user service.
+
 `service uninstall` removes the systemd or Windows SCM registration but
-intentionally preserves the managed binary and credential-bearing state. Delete
-`/var/lib/airlock-host` or `%ProgramData%\Airlock\Host` separately only when the
-host is being permanently decommissioned.
+intentionally preserves the managed binary and credential-bearing state. The
+same applies to a Linux user service; uninstalling it does not change lingering.
+Delete `/var/lib/airlock-host`, `~/.config/airlock/host`, or
+`%ProgramData%\Airlock\Host` separately only when that host identity is being
+permanently decommissioned.
 
 Windows ZIP archives contain `install-airlock-host.ps1`. Run it from an
 elevated PowerShell session after verifying `SHA256SUMS`; it delegates native

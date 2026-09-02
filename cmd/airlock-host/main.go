@@ -40,10 +40,15 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return runWithServiceManager(args, stdin, stdout, stderr, newNativeServiceManager)
+}
+
+func runWithServiceManager(args []string, stdin io.Reader, stdout, stderr io.Writer, managerFactory nativeServiceManagerFactory) error {
 	global := flag.NewFlagSet("airlock-host", flag.ContinueOnError)
 	global.SetOutput(stderr)
 	global.Usage = func() { writeUsage(stderr) }
 	stateDirectory := global.String("state-dir", "", "independent host state directory")
+	userService := global.Bool("user", false, "use the per-user managed service")
 	if err := global.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -51,6 +56,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return err
 	}
 	args = global.Args()
+	if *userService && *stateDirectory != "" {
+		return errors.New("airlock-host: --user and --state-dir cannot be combined")
+	}
+	scope := nativeServiceSystem
+	if *userService {
+		scope = nativeServiceUser
+	}
 	if len(args) == 0 {
 		writeUsage(stdout)
 		return nil
@@ -69,21 +81,27 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		_, err := fmt.Fprintf(stdout, "airlock-host v%s\n", connectorhost.Version)
 		return err
 	}
+	if *userService && !nativeServiceSupported {
+		return errors.New("airlock-host: per-user managed services are supported on Linux")
+	}
 	if args[0] == "service" {
 		if *stateDirectory != "" {
 			return errors.New("airlock-host: managed services use a fixed machine state directory; do not pass --state-dir")
 		}
-		return serviceCommand(args[1:], stdin, stdout, stderr)
+		return serviceCommand(scope, managerFactory, args[1:], stdin, stdout, stderr)
 	}
 	if args[0] == "enroll" {
-		return enrollCommand(*stateDirectory, args[1:], stdin, stdout, stderr)
+		return enrollCommand(scope, managerFactory, *stateDirectory, args[1:], stdin, stdout, stderr)
+	}
+	if *userService && args[0] == "serve" {
+		return errors.New("airlock-host: --user selects a managed service and cannot be used with serve")
 	}
 	if *stateDirectory == "" {
 		root, err := resolveStateDirectory(args[0], func() (string, error) {
 			if !nativeServiceSupported {
 				return defaultStateDirectory()
 			}
-			manager, err := newNativeServiceManager()
+			manager, err := managerFactory(scope)
 			if err != nil {
 				return "", err
 			}
@@ -118,7 +136,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 }
 
-func enrollCommand(stateDirectory string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+func enrollCommand(scope nativeServiceScope, managerFactory nativeServiceManagerFactory, stateDirectory string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	airlockURL, mode, err := parseEnrollmentOptions("enroll", args, stdin, stdout, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -131,11 +149,11 @@ func enrollCommand(stateDirectory string, args []string, stdin io.Reader, stdout
 	if stateDirectory != "" {
 		return enrollHost(ctx, stateDirectory, airlockURL, mode, stdout)
 	}
-	manager, err := newNativeServiceManager()
+	manager, err := managerFactory(scope)
 	if err != nil {
 		return err
 	}
-	return enrollManagedService(ctx, manager, airlockURL, mode, stdout)
+	return enrollManagedService(ctx, scope, manager, airlockURL, mode, stdout)
 }
 
 func parseEnrollmentOptions(command string, args []string, stdin io.Reader, stdout, stderr io.Writer) (string, connectorhost.AccessMode, error) {
@@ -552,15 +570,20 @@ Managed host quick start:
   sudo airlock-host enroll --airlock https://airlock.example
   sudo airlock-host enroll --airlock https://airlock.example --mode full
 
+Per-user Linux host quick start:
+  airlock-host --user service install
+  airlock-host --user service start
+  airlock-host --user enroll --airlock https://airlock.example
+
 The interactive enrollment flow asks for full, update_only, or none. Use
 --mode for noninteractive enrollment.
 
 Usage:
-  airlock-host enroll --airlock HTTPS-ORIGIN [--mode MODE]
-  airlock-host access get
-  airlock-host access set full|update_only|none
-  airlock-host connector <install|update|rollback|remove|list|status>
-  airlock-host service <install|start|stop|status|uninstall|enroll>
+  airlock-host [--user] service <install|start|stop|status|uninstall|enroll>
+  airlock-host [--user] enroll --airlock HTTPS-ORIGIN [--mode MODE]
+  airlock-host [--user] access get
+  airlock-host [--user] access set full|update_only|none
+  airlock-host [--user] connector <install|update|rollback|remove|list|status>
   airlock-host version
 
 Standalone mode:
@@ -568,6 +591,7 @@ Standalone mode:
   airlock-host --state-dir DIR serve [--control-port PORT]
 
 Options:
+  --user           use the per-user Linux managed service
   --state-dir DIR  use an independent standalone state directory
   -h, --help       show this help
 `)

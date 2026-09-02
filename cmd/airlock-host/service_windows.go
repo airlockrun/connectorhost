@@ -113,7 +113,13 @@ func (h *windowsEventLogHandler) WithGroup(name string) slog.Handler {
 	return &clone
 }
 
-func newNativeServiceManager() (nativeServiceManager, error) {
+func newNativeServiceManager(scope nativeServiceScope) (nativeServiceManager, error) {
+	if scope == nativeServiceUser {
+		return nil, errors.New("airlock-host: per-user managed services are supported on Linux")
+	}
+	if scope != nativeServiceSystem {
+		return nil, errors.New("airlock-host: invalid managed service scope")
+	}
 	programFiles, err := windows.KnownFolderPath(windows.FOLDERID_ProgramFiles, windows.KF_FLAG_DEFAULT)
 	if err != nil {
 		return nil, fmt.Errorf("airlock-host: locate Program Files: %w", err)
@@ -133,7 +139,7 @@ func runNativeService(args []string) (bool, error) {
 	if len(args) == 0 || args[0] != windowsServiceMarker {
 		return false, nil
 	}
-	manager, err := newNativeServiceManager()
+	manager, err := newNativeServiceManager(nativeServiceSystem)
 	if err != nil {
 		return true, err
 	}

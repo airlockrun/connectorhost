@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -34,28 +35,66 @@ type linuxServicePaths struct {
 type linuxCommandRunner func(context.Context, string, ...string) ([]byte, error)
 
 type linuxServiceManager struct {
-	paths          linuxServicePaths
-	currentExe     func() (string, error)
-	effectiveUID   func() int
-	runCommand     linuxCommandRunner
-	ready          func(context.Context, string) error
-	passwdFile     string
-	commandTimeout time.Duration
+	scope             nativeServiceScope
+	paths             linuxServicePaths
+	userHomeDirectory string
+	currentExe        func() (string, error)
+	effectiveUID      func() int
+	runCommand        linuxCommandRunner
+	ready             func(context.Context, string) error
+	passwdFile        string
+	commandTimeout    time.Duration
 }
 
-func newNativeServiceManager() (nativeServiceManager, error) {
-	return &linuxServiceManager{
-		paths: linuxServicePaths{
-			executable:     "/usr/local/bin/airlock-host",
-			stateDirectory: "/var/lib/airlock-host",
-			unitFile:       "/etc/systemd/system/airlock-host.service",
-		},
+func newNativeServiceManager(scope nativeServiceScope) (nativeServiceManager, error) {
+	paths := linuxServicePaths{
+		executable:     "/usr/local/bin/airlock-host",
+		stateDirectory: "/var/lib/airlock-host",
+		unitFile:       "/etc/systemd/system/airlock-host.service",
+	}
+	var userHomeDirectory string
+	if scope == nativeServiceUser {
+		if os.Geteuid() == 0 {
+			return nil, errors.New("airlock-host: --user cannot be used as root")
+		}
+		account, err := user.Current()
+		if err != nil {
+			return nil, fmt.Errorf("airlock-host: locate current user account: %w", err)
+		}
+		homeDirectory := account.HomeDir
+		paths, err = linuxUserServicePaths(homeDirectory)
+		if err != nil {
+			return nil, err
+		}
+		userHomeDirectory = homeDirectory
+	} else if scope != nativeServiceSystem {
+		return nil, errors.New("airlock-host: invalid managed service scope")
+	}
+	manager := &linuxServiceManager{
+		scope:          scope,
+		paths:          paths,
 		currentExe:     os.Executable,
 		effectiveUID:   os.Geteuid,
 		runCommand:     runLinuxCommand,
 		ready:          linuxHostReady,
 		passwdFile:     "/etc/passwd",
 		commandTimeout: 30 * time.Second,
+	}
+	if scope == nativeServiceUser {
+		manager.userHomeDirectory = userHomeDirectory
+	}
+	return manager, nil
+}
+
+func linuxUserServicePaths(homeDirectory string) (linuxServicePaths, error) {
+	if !filepath.IsAbs(homeDirectory) {
+		return linuxServicePaths{}, errors.New("airlock-host: user home directory must be absolute")
+	}
+	configDirectory := filepath.Join(homeDirectory, ".config")
+	return linuxServicePaths{
+		executable:     filepath.Join(homeDirectory, ".local", "bin", "airlock-host"),
+		stateDirectory: filepath.Join(configDirectory, "airlock", "host"),
+		unitFile:       filepath.Join(configDirectory, "systemd", "user", linuxServiceUnitName),
 	}, nil
 }
 
@@ -68,8 +107,16 @@ func runNativeService([]string) (bool, error) {
 }
 
 func (m *linuxServiceManager) Install(ctx context.Context) error {
-	if m.effectiveUID() != 0 {
+	if m.scope == nativeServiceSystem && m.effectiveUID() != 0 {
 		return errors.New("airlock-host: service installation requires root")
+	}
+	if m.scope == nativeServiceUser && m.effectiveUID() == 0 {
+		return errors.New("airlock-host: --user cannot be used as root")
+	}
+	if m.scope == nativeServiceUser {
+		if err := m.validateUserManagerConfiguration(ctx); err != nil {
+			return err
+		}
 	}
 	sourcePath, err := m.currentExe()
 	if err != nil {
@@ -81,8 +128,10 @@ func (m *linuxServiceManager) Install(ctx context.Context) error {
 	}
 	defer source.Close()
 
-	if err := m.createAccount(ctx); err != nil {
-		return err
+	if m.scope == nativeServiceSystem {
+		if err := m.createAccount(ctx); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(m.paths.executable), 0o755); err != nil {
 		return fmt.Errorf("airlock-host: create executable directory: %w", err)
@@ -90,14 +139,20 @@ func (m *linuxServiceManager) Install(ctx context.Context) error {
 	if err := copyExecutableIfNeeded(ctx, source, m.paths.executable); err != nil {
 		return fmt.Errorf("airlock-host: install executable: %w", err)
 	}
-	if err := os.MkdirAll(m.paths.stateDirectory, 0o750); err != nil {
+	stateMode := os.FileMode(0o750)
+	if m.scope == nativeServiceUser {
+		stateMode = 0o700
+	}
+	if err := os.MkdirAll(m.paths.stateDirectory, stateMode); err != nil {
 		return fmt.Errorf("airlock-host: create state directory: %w", err)
 	}
-	if err := os.Chmod(m.paths.stateDirectory, 0o750); err != nil {
+	if err := os.Chmod(m.paths.stateDirectory, stateMode); err != nil {
 		return fmt.Errorf("airlock-host: set state directory permissions: %w", err)
 	}
-	if err := m.checkedCommand(ctx, "chown", "--recursive", "--no-dereference", linuxServiceUser+":"+linuxServiceGroup, m.paths.stateDirectory); err != nil {
-		return err
+	if m.scope == nativeServiceSystem {
+		if err := m.checkedCommand(ctx, "chown", "--recursive", "--no-dereference", linuxServiceUser+":"+linuxServiceGroup, m.paths.stateDirectory); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(m.paths.unitFile), 0o755); err != nil {
 		return fmt.Errorf("airlock-host: create systemd unit directory: %w", err)
@@ -105,7 +160,7 @@ func (m *linuxServiceManager) Install(ctx context.Context) error {
 	if err := writeFileIfNeeded(ctx, m.paths.unitFile, []byte(m.systemdUnit()), 0o644); err != nil {
 		return fmt.Errorf("airlock-host: install systemd unit: %w", err)
 	}
-	if err := m.checkedCommand(ctx, "systemctl", "enable", linuxServiceUnitName); err != nil {
+	if err := m.checkedSystemctl(ctx, "enable", linuxServiceUnitName); err != nil {
 		return err
 	}
 	return m.reloadSystemd(ctx)
@@ -127,7 +182,7 @@ func (m *linuxServiceManager) Start(ctx context.Context) error {
 		}
 		return m.waitForReady(ctx)
 	case servicePaused:
-		if err := m.checkedCommand(ctx, "systemctl", "thaw", linuxServiceUnitName); err != nil {
+		if err := m.checkedSystemctl(ctx, "thaw", linuxServiceUnitName); err != nil {
 			return err
 		}
 		if err := m.waitForState(ctx, serviceRunning); err != nil {
@@ -135,7 +190,7 @@ func (m *linuxServiceManager) Start(ctx context.Context) error {
 		}
 		return m.waitForReady(ctx)
 	default:
-		if err := m.checkedCommand(ctx, "systemctl", "start", linuxServiceUnitName); err != nil {
+		if err := m.checkedSystemctl(ctx, "start", linuxServiceUnitName); err != nil {
 			return err
 		}
 		if err := m.waitForState(ctx, serviceRunning); err != nil {
@@ -154,7 +209,7 @@ func (m *linuxServiceManager) Stop(ctx context.Context) error {
 	case serviceNotInstalled, serviceStopped:
 		return nil
 	default:
-		return m.checkedCommand(ctx, "systemctl", "stop", linuxServiceUnitName)
+		return m.checkedSystemctl(ctx, "stop", linuxServiceUnitName)
 	}
 }
 
@@ -166,7 +221,7 @@ func (m *linuxServiceManager) Status(ctx context.Context) (nativeServiceStatus, 
 	if err != nil {
 		return nativeServiceStatus{}, fmt.Errorf("airlock-host: inspect systemd unit: %w", err)
 	}
-	output, err := m.command(ctx, "systemctl", "show", linuxServiceUnitName, "--no-pager",
+	output, err := m.systemctlCommand(ctx, "show", linuxServiceUnitName, "--no-pager",
 		"--property=LoadState", "--property=ActiveState", "--property=SubState",
 		"--property=FreezerState", "--property=MainPID")
 	if err != nil {
@@ -207,7 +262,7 @@ func (m *linuxServiceManager) Status(ctx context.Context) (nativeServiceStatus, 
 func (m *linuxServiceManager) Uninstall(ctx context.Context) error {
 	_, err := os.Lstat(m.paths.unitFile)
 	if errors.Is(err, os.ErrNotExist) {
-		return m.checkedCommand(ctx, "systemctl", "daemon-reload")
+		return m.checkedSystemctl(ctx, "daemon-reload")
 	}
 	if err != nil {
 		return fmt.Errorf("airlock-host: inspect systemd unit: %w", err)
@@ -217,17 +272,17 @@ func (m *linuxServiceManager) Uninstall(ctx context.Context) error {
 		return err
 	}
 	if status.State != serviceStopped && status.State != serviceNotInstalled {
-		if err := m.checkedCommand(ctx, "systemctl", "stop", linuxServiceUnitName); err != nil {
+		if err := m.checkedSystemctl(ctx, "stop", linuxServiceUnitName); err != nil {
 			return err
 		}
 	}
-	if err := m.checkedCommand(ctx, "systemctl", "disable", linuxServiceUnitName); err != nil {
+	if err := m.checkedSystemctl(ctx, "disable", linuxServiceUnitName); err != nil {
 		return err
 	}
 	if err := os.Remove(m.paths.unitFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("airlock-host: remove systemd unit: %w", err)
 	}
-	return m.checkedCommand(ctx, "systemctl", "daemon-reload")
+	return m.checkedSystemctl(ctx, "daemon-reload")
 }
 
 func (m *linuxServiceManager) StateDirectory() string {
@@ -358,13 +413,31 @@ func (m *linuxServiceManager) validateAccount(ctx context.Context) error {
 }
 
 func (m *linuxServiceManager) systemdUnit() string {
+	controlPort := linuxControlPort
+	if m.scope == nativeServiceUser {
+		controlPort = 0
+	}
 	arguments := []string{
 		m.paths.executable,
 		"--state-dir", m.paths.stateDirectory,
-		"serve", "--control-port", strconv.Itoa(linuxControlPort),
+		"serve", "--control-port", strconv.Itoa(controlPort),
 	}
 	for index := range arguments {
 		arguments[index] = quoteSystemdArgument(arguments[index])
+	}
+	if m.scope == nativeServiceUser {
+		return "[Unit]\n" +
+			"Description=" + nativeServiceDisplayName + "\n" +
+			"\n" +
+			"[Service]\n" +
+			"Type=simple\n" +
+			"UMask=0077\n" +
+			"ExecStart=" + strings.Join(arguments, " ") + "\n" +
+			"Restart=on-failure\n" +
+			"RestartSec=5s\n" +
+			"\n" +
+			"[Install]\n" +
+			"WantedBy=default.target\n"
 	}
 	return "[Unit]\n" +
 		"Description=" + nativeServiceDisplayName + "\n" +
@@ -404,13 +477,61 @@ func (m *linuxServiceManager) checkedCommand(ctx context.Context, name string, a
 	return nil
 }
 
+func (m *linuxServiceManager) validateUserManagerConfiguration(ctx context.Context) error {
+	output, err := m.systemctlCommand(ctx, "show-environment")
+	if err != nil {
+		return commandError("systemctl", output, err)
+	}
+	managerHomeDirectory := ""
+	managerConfigDirectory := ""
+	for _, line := range strings.Split(string(output), "\n") {
+		if value, ok := strings.CutPrefix(line, "HOME="); ok {
+			managerHomeDirectory = value
+		}
+		if value, ok := strings.CutPrefix(line, "XDG_CONFIG_HOME="); ok && value != "" {
+			managerConfigDirectory = value
+		}
+	}
+	if !filepath.IsAbs(managerHomeDirectory) {
+		return errors.New("airlock-host: the systemd user manager has no absolute HOME")
+	}
+	if filepath.Clean(managerHomeDirectory) != filepath.Clean(m.userHomeDirectory) {
+		return errors.New("airlock-host: HOME does not match the systemd user manager environment")
+	}
+	if managerConfigDirectory == "" {
+		managerConfigDirectory = filepath.Join(managerHomeDirectory, ".config")
+	}
+	if !filepath.IsAbs(managerConfigDirectory) {
+		return errors.New("airlock-host: the systemd user manager has a relative XDG_CONFIG_HOME")
+	}
+	if filepath.Clean(managerConfigDirectory) != filepath.Join(filepath.Clean(m.userHomeDirectory), ".config") {
+		return errors.New("airlock-host: custom XDG_CONFIG_HOME is not supported for per-user managed services")
+	}
+	return nil
+}
+
+func (m *linuxServiceManager) checkedSystemctl(ctx context.Context, args ...string) error {
+	output, err := m.systemctlCommand(ctx, args...)
+	if err != nil {
+		return commandError("systemctl", output, err)
+	}
+	return nil
+}
+
+func (m *linuxServiceManager) systemctlCommand(ctx context.Context, args ...string) ([]byte, error) {
+	if m.scope == nativeServiceUser {
+		args = append([]string{"--user"}, args...)
+	}
+	return m.command(ctx, "systemctl", args...)
+}
+
 func (m *linuxServiceManager) reloadSystemd(ctx context.Context) error {
-	output, err := m.command(ctx, "systemctl", "daemon-reload")
+	output, err := m.systemctlCommand(ctx, "daemon-reload")
 	if err == nil {
 		return nil
 	}
 	message := string(output)
-	if strings.Contains(message, "System has not been booted with systemd") || strings.Contains(message, "Failed to connect to bus") {
+	if m.scope == nativeServiceSystem && (strings.Contains(message, "System has not been booted with systemd") || strings.Contains(message, "Failed to connect to bus")) {
 		return nil
 	}
 	return commandError("systemctl", output, err)

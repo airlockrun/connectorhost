@@ -1,5 +1,5 @@
-github.com/airlockrun/agentsdk v0.6.0-rc.6 h1:bDmLFb52ZjG3s9KT9hmufsrKqhByMqTJX9nSdG27xQM=
-github.com/airlockrun/agentsdk v0.6.0-rc.6/go.mod h1:tPGrq3gfsaRK4gI3xH0LuSFcYSJIFafZelCKPoQuvMM=
+github.com/airlockrun/agentsdk v0.6.0-rc.7 h1:HkeEBgiRHvaVx0XHsUnOIg8wKsyztdGu7xLyC5/YMPI=
+github.com/airlockrun/agentsdk v0.6.0-rc.7/go.mod h1:tPGrq3gfsaRK4gI3xH0LuSFcYSJIFafZelCKPoQuvMM=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 golang.org/x/sys v0.45.0 h1:dO4czNzziLiiXplLQgBCEpCvXQ3dnkn0SdaZSYdQ+FY=

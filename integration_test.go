@@ -153,7 +153,7 @@ func helperManifest() protocol.Manifest {
 	if runtime.GOARCH == "arm" {
 		target = runtime.GOOS + "-armv7"
 	}
-	manifest := protocol.Manifest{ProtocolMajor: protocol.Major, ProtocolMinor: protocol.Minor, Features: []string{"hosted-child-v1"}, Targets: []string{target}, ArtifactDigest: hex.EncodeToString(digest[:]), Interface: protocol.Interface{Kind: "helper", ContractID: "io.airlockrun.connectorhost_helper", Name: "Helper", Description: "Connector host test helper.", ArtifactVersion: "1"}}
+	manifest := protocol.Manifest{ProtocolMajor: protocol.Major, ProtocolMinor: protocol.Minor, Features: []string{"hosted-child-v1"}, Targets: []string{target}, ArtifactDigest: hex.EncodeToString(digest[:]), Interface: protocol.Interface{Kind: "helper", ContractID: "io.airlockrun.connectorhost_helper", Name: "Helper", Description: "Connector host test helper.", ArtifactVersion: "1"}, Settings: []protocol.SettingDescriptor{{Name: "broker-url", JSONName: "broker.url", Kind: "url"}}}
 	manifest.InterfaceHash, _ = protocol.InterfaceDigest(manifest.Interface)
 	return manifest
 }

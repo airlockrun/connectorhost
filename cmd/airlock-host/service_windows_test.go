@@ -288,7 +288,7 @@ func TestWindowsSCMServiceLifecycle(t *testing.T) {
 	if os.Getenv("GITHUB_ACTIONS") != "true" || os.Getenv("RUNNER_TEMP") == "" {
 		t.Fatal("native SCM test is restricted to an isolated GitHub Actions runner")
 	}
-	managerValue, err := newNativeServiceManager()
+	managerValue, err := newNativeServiceManager(nativeServiceSystem)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -437,6 +437,12 @@ func main() {
 	}
 	if status, err := manager.Status(t.Context()); err != nil || status.State != serviceNotInstalled {
 		t.Fatalf("status after uninstall = %+v, %v", status, err)
+	}
+}
+
+func TestWindowsRejectsUserServiceScope(t *testing.T) {
+	if _, err := newNativeServiceManager(nativeServiceUser); err == nil || !strings.Contains(err.Error(), "supported on Linux") {
+		t.Fatalf("newNativeServiceManager error = %v", err)
 	}
 }
 

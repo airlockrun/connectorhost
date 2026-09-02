@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -190,8 +191,53 @@ func TestRootHelpShowsManagedQuickStart(t *testing.T) {
 	if err := run(nil, bytes.NewReader(nil), &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(stdout.String(), "Managed host quick start") || !strings.Contains(stdout.String(), "--mode") {
+	if !strings.Contains(stdout.String(), "Managed host quick start") || !strings.Contains(stdout.String(), "--user service install") || !strings.Contains(stdout.String(), "--mode") {
 		t.Fatalf("help output = %q", stdout.String())
+	}
+}
+
+func TestUserServiceRejectsStandaloneState(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"--user", "--state-dir", t.TempDir(), "access", "get"}, bytes.NewReader(nil), &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "cannot be combined") {
+		t.Fatalf("run error = %v", err)
+	}
+}
+
+func TestUserServiceRejectsStandaloneServe(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := run([]string{"--user", "serve"}, bytes.NewReader(nil), &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "cannot be used with serve") {
+		t.Fatalf("run error = %v", err)
+	}
+}
+
+func TestUserFlagRoutesManagedCommandsToUserService(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "user-state")
+	var scopes []nativeServiceScope
+	factory := func(scope nativeServiceScope) (nativeServiceManager, error) {
+		scopes = append(scopes, scope)
+		return &testNativeServiceManager{stateDirectory: root, status: nativeServiceStatus{State: serviceNotInstalled}}, nil
+	}
+	var stdout, stderr bytes.Buffer
+	if err := runWithServiceManager([]string{"--user", "connector", "list"}, bytes.NewReader(nil), &stdout, &stderr, factory); err != nil {
+		t.Fatal(err)
+	}
+	if err := runWithServiceManager([]string{"--user", "service", "status"}, bytes.NewReader(nil), &stdout, &stderr, factory); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"--user", "enroll", "--airlock", "https://airlock.example", "--mode", "none"},
+		{"--user", "service", "enroll", "--airlock", "https://airlock.example", "--mode", "none"},
+	} {
+		err := runWithServiceManager(args, bytes.NewReader(nil), &stdout, &stderr, factory)
+		if err == nil || !strings.Contains(err.Error(), "--user service install") {
+			t.Fatalf("run(%v) error = %v", args, err)
+		}
+	}
+	want := []nativeServiceScope{nativeServiceUser, nativeServiceUser, nativeServiceUser, nativeServiceUser}
+	if !reflect.DeepEqual(scopes, want) {
+		t.Fatalf("manager scopes = %v, want %v", scopes, want)
 	}
 }
 

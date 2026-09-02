@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"path/filepath"
@@ -41,11 +42,36 @@ func TestManagedEnrollmentDoesNotStartEnrolledService(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := &testNativeServiceManager{stateDirectory: root, status: nativeServiceStatus{State: serviceStopped}}
-	err = enrollManagedService(t.Context(), manager, "https://airlock.example", connectorhost.AccessNone, io.Discard)
+	err = enrollManagedService(t.Context(), nativeServiceSystem, manager, "https://airlock.example", connectorhost.AccessNone, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "already enrolled") {
 		t.Fatalf("enrollment error = %v", err)
 	}
 	if manager.startCalls != 0 {
 		t.Fatalf("start calls = %d", manager.startCalls)
+	}
+}
+
+func TestUserManagedEnrollmentReportsScopedInstallCommand(t *testing.T) {
+	manager := &testNativeServiceManager{status: nativeServiceStatus{State: serviceNotInstalled}}
+	err := enrollManagedService(t.Context(), nativeServiceUser, manager, "https://airlock.example", connectorhost.AccessNone, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "airlock-host --user service install") {
+		t.Fatalf("enrollment error = %v", err)
+	}
+}
+
+func TestUserServiceInstallReportsScopedNextSteps(t *testing.T) {
+	manager := &testNativeServiceManager{}
+	factory := func(scope nativeServiceScope) (nativeServiceManager, error) {
+		if scope != nativeServiceUser {
+			t.Fatalf("scope = %v", scope)
+		}
+		return manager, nil
+	}
+	var output bytes.Buffer
+	if err := serviceCommand(nativeServiceUser, factory, []string{"install"}, bytes.NewReader(nil), &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "airlock-host --user service start") || !strings.Contains(output.String(), "airlock-host --user enroll") {
+		t.Fatalf("install output = %q", output.String())
 	}
 }
