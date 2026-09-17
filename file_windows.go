@@ -4,17 +4,13 @@ package connectorhost
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
-
-var moveFileEx = syscall.NewLazyDLL("kernel32.dll").NewProc("MoveFileExW")
 
 const windowsFileAllAccess windows.ACCESS_MASK = windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1ff
 
@@ -35,17 +31,41 @@ func openSharedRead(path string) (*os.File, error) {
 }
 
 func replaceFile(from, to string) error {
-	fromPointer, err := syscall.UTF16PtrFromString(from)
+	fromPointer, err := windows.UTF16PtrFromString(from)
 	if err != nil {
 		return err
 	}
-	toPointer, err := syscall.UTF16PtrFromString(to)
+	destination, err := filepath.Abs(to)
 	if err != nil {
 		return err
 	}
-	result, _, callErr := moveFileEx.Call(uintptr(unsafe.Pointer(fromPointer)), uintptr(unsafe.Pointer(toPointer)), 0x1|0x8)
-	if result == 0 {
-		return fmt.Errorf("MoveFileExW: %w", callErr)
+	name, err := windows.UTF16FromString(destination)
+	if err != nil {
+		return err
+	}
+	handle, err := windows.CreateFile(fromPointer, windows.DELETE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
+	}
+	defer windows.CloseHandle(handle)
+	// POSIX replacement preserves open readers' snapshots while publishing the
+	// new file, including its protected ACL, in one namespace operation.
+	type renameInfo struct {
+		Flags          uint32
+		RootDirectory  windows.Handle
+		FileNameLength uint32
+		FileName       [1]uint16
+	}
+	var layout renameInfo
+	buffer := make([]byte, int(unsafe.Sizeof(layout))+len(name)*2)
+	info := (*renameInfo)(unsafe.Pointer(&buffer[0]))
+	info.Flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS
+	info.FileNameLength = uint32((len(name) - 1) * 2)
+	copy(unsafe.Slice(&info.FileName[0], len(name)), name)
+	if err := windows.SetFileInformationByHandle(handle, windows.FileRenameInfoEx, &buffer[0], uint32(len(buffer))); err != nil {
+		return &os.LinkError{Op: "rename", Old: from, New: to, Err: err}
 	}
 	return nil
 }
