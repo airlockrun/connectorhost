@@ -114,6 +114,61 @@ func TestLocalControlPreservesDescriptorWithDifferentNonce(t *testing.T) {
 	}
 }
 
+func TestControlDescriptorReadableDuringPublication(t *testing.T) {
+	token, err := randomControlSecret(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce, err := randomControlSecret(24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ControlDescriptor{Protocol: controlProtocol, Port: 12345, Token: token, PID: os.Getpid(), Nonce: nonce}
+	body, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 100 {
+		t.Run(fmt.Sprint(i), func(t *testing.T) {
+			root := t.TempDir()
+			done := make(chan struct{})
+			var writeErr error
+			go func() {
+				defer close(done)
+				writeErr = atomicWrite(filepath.Join(root, controlDescriptor), body, 0o600)
+			}()
+			defer func() {
+				<-done
+				if writeErr != nil {
+					t.Errorf("publish descriptor: %v", writeErr)
+				}
+			}()
+			for {
+				finished := false
+				select {
+				case <-done:
+					finished = true
+				default:
+				}
+				got, err := ReadControlDescriptor(root)
+				if !finished && errors.Is(err, os.ErrNotExist) {
+					runtime.Gosched()
+					continue
+				}
+				if err != nil {
+					t.Fatalf("read published descriptor: %v", err)
+				}
+				if got != want {
+					t.Fatalf("descriptor = %+v, want %+v", got, want)
+				}
+				if finished {
+					break
+				}
+			}
+		})
+	}
+}
+
 func TestLocalControlRejectsUnknownJSONFields(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "instance")
 	store, err := OpenStore(root)

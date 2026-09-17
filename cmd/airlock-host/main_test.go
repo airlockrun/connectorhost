@@ -207,7 +207,11 @@ func TestUserServiceRejectsStandaloneState(t *testing.T) {
 func TestUserServiceRejectsStandaloneServe(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := run([]string{"--user", "serve"}, bytes.NewReader(nil), &stdout, &stderr)
-	if err == nil || !strings.Contains(err.Error(), "cannot be used with serve") {
+	want := "cannot be used with serve"
+	if !nativeServiceSupported {
+		want = "per-user managed services are supported on Linux"
+	}
+	if err == nil || !strings.Contains(err.Error(), want) {
 		t.Fatalf("run error = %v", err)
 	}
 }
@@ -219,23 +223,36 @@ func TestUserFlagRoutesManagedCommandsToUserService(t *testing.T) {
 		scopes = append(scopes, scope)
 		return &testNativeServiceManager{stateDirectory: root, status: nativeServiceStatus{State: serviceNotInstalled}}, nil
 	}
-	var stdout, stderr bytes.Buffer
-	if err := runWithServiceManager([]string{"--user", "connector", "list"}, bytes.NewReader(nil), &stdout, &stderr, factory); err != nil {
-		t.Fatal(err)
-	}
-	if err := runWithServiceManager([]string{"--user", "service", "status"}, bytes.NewReader(nil), &stdout, &stderr, factory); err != nil {
-		t.Fatal(err)
-	}
-	for _, args := range [][]string{
-		{"--user", "enroll", "--airlock", "https://airlock.example", "--mode", "none"},
-		{"--user", "service", "enroll", "--airlock", "https://airlock.example", "--mode", "none"},
+	for _, test := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"connector", []string{"--user", "connector", "list"}, ""},
+		{"status", []string{"--user", "service", "status"}, ""},
+		{"enroll", []string{"--user", "enroll", "--airlock", "https://airlock.example", "--mode", "none"}, "--user service install"},
+		{"service enroll", []string{"--user", "service", "enroll", "--airlock", "https://airlock.example", "--mode", "none"}, "--user service install"},
 	} {
-		err := runWithServiceManager(args, bytes.NewReader(nil), &stdout, &stderr, factory)
-		if err == nil || !strings.Contains(err.Error(), "--user service install") {
-			t.Fatalf("run(%v) error = %v", args, err)
-		}
+		t.Run(test.name, func(t *testing.T) {
+			want := test.want
+			if !nativeServiceSupported {
+				want = "per-user managed services are supported on Linux"
+			}
+			var stdout, stderr bytes.Buffer
+			err := runWithServiceManager(test.args, bytes.NewReader(nil), &stdout, &stderr, factory)
+			if want == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("run(%v) error = %v, want %q", test.args, err, want)
+			}
+		})
 	}
 	want := []nativeServiceScope{nativeServiceUser, nativeServiceUser, nativeServiceUser, nativeServiceUser}
+	if !nativeServiceSupported {
+		want = nil
+	}
 	if !reflect.DeepEqual(scopes, want) {
 		t.Fatalf("manager scopes = %v, want %v", scopes, want)
 	}
