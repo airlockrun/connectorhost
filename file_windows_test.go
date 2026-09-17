@@ -3,12 +3,77 @@
 package connectorhost
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/windows"
 )
+
+func TestControlDescriptorSharesRenameAccess(t *testing.T) {
+	root := t.TempDir()
+	token, err := randomControlSecret(32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce, err := randomControlSecret(24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ControlDescriptor{Protocol: controlProtocol, Port: 12345, Token: token, PID: os.Getpid(), Nonce: nonce}
+	body, err := json.Marshal(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "unpublished")
+	if err := atomicWrite(source, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	name, err := windows.UTF16PtrFromString(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep rename access open after publication to exercise sharing deterministically.
+	handle, err := windows.CreateFile(name, windows.DELETE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer windows.CloseHandle(handle)
+	if err := replaceFile(source, filepath.Join(root, controlDescriptor)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadControlDescriptor(root)
+	if err != nil || got != want {
+		t.Fatalf("read during rename: %+v, %v", got, err)
+	}
+}
+
+func TestSharedReaderAllowsAtomicReplacement(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "snapshot")
+	if err := atomicWrite(path, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := openSharedRead(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if err := atomicWrite(path, []byte("after"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(reader)
+	if err != nil || string(body) != "before" {
+		t.Fatalf("open snapshot = %q, %v", body, err)
+	}
+	body, err = os.ReadFile(path)
+	if err != nil || string(body) != "after" {
+		t.Fatalf("replacement = %q, %v", body, err)
+	}
+}
 
 func TestAtomicWritePreservesPrivateACL(t *testing.T) {
 	root := t.TempDir()

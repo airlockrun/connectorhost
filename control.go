@@ -321,7 +321,7 @@ func randomControlSecret(bytes int) (string, error) {
 
 func ReadControlDescriptor(root string) (ControlDescriptor, error) {
 	path := filepath.Join(root, controlDescriptor)
-	file, err := os.Open(path)
+	file, err := openSharedRead(path)
 	if err != nil {
 		return ControlDescriptor{}, err
 	}

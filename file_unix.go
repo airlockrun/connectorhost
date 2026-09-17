@@ -4,6 +4,8 @@ package connectorhost
 
 import "os"
 
+func openSharedRead(path string) (*os.File, error) { return os.Open(path) }
+
 func replaceFile(from, to string) error { return os.Rename(from, to) }
 func secureDirectory(path string) error { return os.Chmod(path, 0o700) }
 func secureFile(path string) error      { return os.Chmod(path, 0o600) }
