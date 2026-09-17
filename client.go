@@ -1,23 +1,43 @@
 package connectorhost
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/airlockrun/agentsdk/connector/protocol"
+	"github.com/coder/websocket"
 )
 
 type ControlClient struct {
 	baseURL    string
 	credential string
 	http       *http.Client
+	mu         sync.Mutex
+	session    *controlSession
+	sequence   atomic.Uint64
+}
+
+type controlSession struct {
+	conn    *websocket.Conn
+	done    chan struct{}
+	pending map[string]chan protocol.HostMessage
+}
+
+type ControlError struct {
+	Code    int
+	Message string
+}
+
+func (e *ControlError) Error() string {
+	return fmt.Sprintf("connectorhost: control error %d: %s", e.Code, e.Message)
 }
 
 func NewControlClient(baseURL, credential string, client *http.Client) (*ControlClient, error) {
@@ -33,97 +53,176 @@ func NewControlClient(baseURL, credential string, client *http.Client) (*Control
 	}
 	copy := *client
 	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &ControlClient{baseURL: strings.TrimSuffix(baseURL, "/"), credential: credential, http: &copy}, nil
+	return &ControlClient{baseURL: "wss" + strings.TrimSuffix(baseURL, "/")[5:], credential: credential, http: &copy}, nil
+}
+
+// Connect installs the sole outbound session. Requests never create sockets.
+func (c *ControlClient) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.session != nil {
+		return errors.New("connectorhost: session already connected")
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	conn, _, err := websocket.Dial(dialCtx, c.baseURL+"/api/hosts/v1/connect", &websocket.DialOptions{HTTPClient: c.http, HTTPHeader: http.Header{"Authorization": {"Bearer " + c.credential}}, Subprotocols: []string{protocol.HostTransportProtocol}})
+	if err != nil {
+		return err
+	}
+	if conn.Subprotocol() != protocol.HostTransportProtocol {
+		conn.CloseNow()
+		return errors.New("connectorhost: incompatible host transport")
+	}
+	conn.SetReadLimit(protocol.MaxHostMessageBytes)
+	s := &controlSession{conn: conn, done: make(chan struct{}), pending: make(map[string]chan protocol.HostMessage)}
+	c.session = s
+	go c.read(ctx, s)
+	return nil
+}
+
+func (c *ControlClient) read(ctx context.Context, s *controlSession) {
+	defer func() {
+		s.conn.CloseNow()
+		c.mu.Lock()
+		if c.session == s {
+			c.session = nil
+		}
+		close(s.done)
+		c.mu.Unlock()
+	}()
+	for {
+		kind, data, err := s.conn.Read(ctx)
+		if err != nil || kind != websocket.MessageText {
+			return
+		}
+		message, err := protocol.DecodeHostMessage(data)
+		if err != nil || message.Sync != nil || message.Inventory != nil || message.Heartbeat != nil || message.Demand != nil || message.ConnectorEvent != nil || message.ConnectorCompletion != nil || message.ManagementEvent != nil || message.ManagementCompletion != nil {
+			return
+		}
+		c.mu.Lock()
+		pending := s.pending[message.ID]
+		delete(s.pending, message.ID)
+		c.mu.Unlock()
+		if pending == nil {
+			return
+		}
+		pending <- message
+	}
+}
+
+func (c *ControlClient) Close() {
+	c.mu.Lock()
+	s := c.session
+	c.mu.Unlock()
+	if s != nil {
+		s.conn.CloseNow()
+		<-s.done
+	}
+}
+
+func (c *ControlClient) call(ctx context.Context, request protocol.HostMessage) (protocol.HostMessage, error) {
+	request.Protocol, request.ID = protocol.HostTransportProtocol, fmt.Sprint(c.sequence.Add(1))
+	if err := request.Validate(); err != nil {
+		return protocol.HostMessage{}, err
+	}
+	data, err := json.Marshal(request)
+	if err != nil {
+		return protocol.HostMessage{}, err
+	}
+	if len(data) > protocol.MaxHostMessageBytes {
+		return protocol.HostMessage{}, errors.New("connectorhost: host message too large")
+	}
+	c.mu.Lock()
+	s := c.session
+	if s == nil || len(s.pending) >= protocol.MaxHostRequests {
+		c.mu.Unlock()
+		return protocol.HostMessage{}, errors.New("connectorhost: disconnected or request capacity exhausted")
+	}
+	reply := make(chan protocol.HostMessage, 1)
+	s.pending[request.ID] = reply
+	c.mu.Unlock()
+	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err = s.conn.Write(writeCtx, websocket.MessageText, data)
+	cancel()
+	if err != nil {
+		s.conn.CloseNow()
+		return protocol.HostMessage{}, err
+	}
+	select {
+	case response := <-reply:
+		if response.Error != nil {
+			return response, &ControlError{Code: response.Error.Code, Message: response.Error.Message}
+		}
+		return response, nil
+	case <-ctx.Done():
+		// Closing fences an unacknowledged demand and all its correlated replies.
+		s.conn.CloseNow()
+		return protocol.HostMessage{}, ctx.Err()
+	case <-s.done:
+		return protocol.HostMessage{}, errors.New("connectorhost: session disconnected")
+	}
 }
 
 func (c *ControlClient) Sync(ctx context.Context, request protocol.HostSyncRequest) (protocol.HostSyncResponse, error) {
-	var response protocol.HostSyncResponse
-	err := c.post(ctx, "/api/hosts/v1/sync", request, &response)
-	return response, err
+	r, err := c.call(ctx, protocol.HostMessage{Sync: &request})
+	if err != nil {
+		return protocol.HostSyncResponse{}, err
+	}
+	if r.Synced == nil {
+		return protocol.HostSyncResponse{}, errors.New("connectorhost: expected sync response")
+	}
+	return *r.Synced, nil
 }
 
 func (c *ControlClient) InventoryMutation(ctx context.Context, request protocol.HostConnectorInventoryMutationRequest) (protocol.HostConnectorInventoryMutationResponse, error) {
-	var response protocol.HostConnectorInventoryMutationResponse
 	if err := protocol.ValidateHostConnectorInventoryMutationRequest(request); err != nil {
-		return response, err
+		return protocol.HostConnectorInventoryMutationResponse{}, err
 	}
-	if err := c.postBounded(ctx, "/api/hosts/v1/connectors/inventory", request, &response, protocol.MaxHostInventoryMutationBytes, 256<<10); err != nil {
-		return response, err
+	r, err := c.call(ctx, protocol.HostMessage{Inventory: &request})
+	if err != nil {
+		return protocol.HostConnectorInventoryMutationResponse{}, err
 	}
+	if r.Inventoried == nil {
+		return protocol.HostConnectorInventoryMutationResponse{}, errors.New("connectorhost: expected inventory response")
+	}
+	response := *r.Inventoried
 	if err := protocol.ValidateHostConnectorInventoryMutationResponse(response); err != nil {
 		return response, err
 	}
-	if response.InstallationID != request.InstallationID || response.AcknowledgedRevision != request.Revision {
-		return response, errors.New("connectorhost: inventory mutation response does not match its request")
-	}
-	if request.Kind == protocol.HostConnectorMutationRemove && len(response.StorageOrigins) != 0 {
-		return response, errors.New("connectorhost: inventory removal acknowledgement includes storage origins")
+	if response.InstallationID != request.InstallationID || response.AcknowledgedRevision != request.Revision || (request.Kind == protocol.HostConnectorMutationRemove && len(response.StorageOrigins) != 0) {
+		return response, errors.New("connectorhost: mismatched inventory acknowledgement")
 	}
 	return response, nil
 }
 
-func (c *ControlClient) Poll(ctx context.Context, request protocol.HostPollRequest) (protocol.HostPollResponse, error) {
-	var response protocol.HostPollResponse
-	err := c.post(ctx, "/api/hosts/v1/work/poll", request, &response)
-	return response, err
+func (c *ControlClient) Demand(ctx context.Context, capacity int) (*protocol.HostWork, error) {
+	r, err := c.call(ctx, protocol.HostMessage{Demand: &protocol.HostDemand{ConnectorCapacity: capacity}})
+	if err == nil && r.Work == nil && r.Ack == nil {
+		err = errors.New("connectorhost: expected work response")
+	}
+	return r.Work, err
 }
 
+func (c *ControlClient) ack(ctx context.Context, request protocol.HostMessage) error {
+	r, err := c.call(ctx, request)
+	if err == nil && r.Ack == nil {
+		return errors.New("connectorhost: expected durable acknowledgement")
+	}
+	return err
+}
+
+func (c *ControlClient) Heartbeat(ctx context.Context, request protocol.HostHeartbeat) error {
+	return c.ack(ctx, protocol.HostMessage{Heartbeat: &request})
+}
 func (c *ControlClient) ConnectorEvent(ctx context.Context, connectorID, jobID string, event protocol.JobEvent) error {
-	return c.post(ctx, "/api/hosts/v1/connectors/"+url.PathEscape(connectorID)+"/jobs/"+url.PathEscape(jobID)+"/events", event, nil)
+	return c.ack(ctx, protocol.HostMessage{ConnectorEvent: &protocol.HostConnectorEvent{ConnectorID: connectorID, JobID: jobID, Event: event}})
 }
-
 func (c *ControlClient) ConnectorCompletion(ctx context.Context, connectorID, jobID string, completion protocol.JobCompletion) error {
-	return c.post(ctx, "/api/hosts/v1/connectors/"+url.PathEscape(connectorID)+"/jobs/"+url.PathEscape(jobID)+"/complete", completion, nil)
+	return c.ack(ctx, protocol.HostMessage{ConnectorCompletion: &protocol.HostConnectorCompletion{ConnectorID: connectorID, JobID: jobID, Completion: completion}})
 }
-
 func (c *ControlClient) ManagementEvent(ctx context.Context, jobID string, event protocol.HostManagementEvent) error {
-	return c.post(ctx, "/api/hosts/v1/management/"+url.PathEscape(jobID)+"/events", event, nil)
+	return c.ack(ctx, protocol.HostMessage{ManagementEvent: &protocol.HostManagementProgress{JobID: jobID, Event: event}})
 }
-
 func (c *ControlClient) ManagementCompletion(ctx context.Context, completion protocol.HostManagementCompletion) error {
-	return c.post(ctx, "/api/hosts/v1/management/"+url.PathEscape(completion.JobID)+"/complete", completion, nil)
-}
-
-func (c *ControlClient) post(ctx context.Context, endpoint string, input, output any) error {
-	return c.postBounded(ctx, endpoint, input, output, protocol.MaxChildFrameBytes, protocol.MaxChildFrameBytes)
-}
-
-func (c *ControlClient) postBounded(ctx context.Context, endpoint string, input, output any, maxRequestBytes, maxResponseBytes int) error {
-	body, err := json.Marshal(input)
-	if err != nil {
-		return err
-	}
-	if len(body) > maxRequestBytes {
-		return errors.New("connectorhost: control request exceeds size limit")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	request.Header.Set("Authorization", "Bearer "+c.credential)
-	request.Header.Set("Content-Type", "application/json")
-	response, err := c.http.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode == http.StatusNoContent {
-		return nil
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		message, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
-		return fmt.Errorf("connectorhost: POST %s returned HTTP %d: %s", endpoint, response.StatusCode, strings.TrimSpace(string(message)))
-	}
-	if output == nil {
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
-		return nil
-	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, int64(maxResponseBytes)+1))
-	if err != nil {
-		return err
-	}
-	if len(data) > maxResponseBytes {
-		return errors.New("connectorhost: control response exceeds size limit")
-	}
-	return strictJSON(data, output)
+	return c.ack(ctx, protocol.HostMessage{ManagementCompletion: &completion})
 }

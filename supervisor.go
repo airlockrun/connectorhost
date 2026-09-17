@@ -27,14 +27,16 @@ type EventSink interface {
 }
 
 type Supervisor struct {
-	store    *Store
-	sink     EventSink
-	ctx      context.Context
-	cancel   context.CancelFunc
-	mu       sync.RWMutex
-	dispatch sync.Mutex
-	children map[string]*childProcess
-	failures map[string]string
+	store     *Store
+	sink      EventSink
+	ctx       context.Context
+	cancel    context.CancelFunc
+	mu        sync.RWMutex
+	dispatch  sync.Mutex
+	lifecycle sync.Mutex
+	watchers  sync.WaitGroup
+	children  map[string]*childProcess
+	failures  map[string]string
 }
 
 type childProcess struct {
@@ -45,6 +47,7 @@ type childProcess struct {
 	terminate   func() error
 	done        chan struct{}
 	processDone chan error
+	outputDone  chan struct{}
 	finishOnce  sync.Once
 	err         error
 	stopping    atomic.Bool
@@ -85,11 +88,13 @@ func (s *Supervisor) StartFailure(ctx context.Context) error {
 }
 
 func (s *Supervisor) Start(ctx context.Context, id string) error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	record, ok := s.store.Connector(id)
 	if !ok {
 		return fmt.Errorf("connectorhost: connector %q is not installed", id)
 	}
-	if err := s.Stop(ctx, id); err != nil {
+	if err := s.stop(ctx, id); err != nil {
 		return err
 	}
 	child, err := s.launch(ctx, record)
@@ -103,15 +108,21 @@ func (s *Supervisor) Start(ctx context.Context, id string) error {
 	s.children[id] = child
 	delete(s.failures, id)
 	s.mu.Unlock()
+	s.watchers.Add(1)
 	go s.watch(id, child)
 	return nil
 }
 
 func (s *Supervisor) Activate(ctx context.Context, record ConnectorRecord, persist func() error) error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	if persist == nil {
 		panic("connectorhost: activation persistence is required")
 	}
-	if err := s.Stop(ctx, record.InstallationID); err != nil {
+	if err := s.store.admitConnector(record); err != nil {
+		return err
+	}
+	if err := s.stop(ctx, record.InstallationID); err != nil {
 		return err
 	}
 	child, err := s.launch(ctx, record)
@@ -126,6 +137,7 @@ func (s *Supervisor) Activate(ctx context.Context, record ConnectorRecord, persi
 	s.children[record.InstallationID] = child
 	delete(s.failures, record.InstallationID)
 	s.mu.Unlock()
+	s.watchers.Add(1)
 	go s.watch(record.InstallationID, child)
 	return nil
 }
@@ -142,37 +154,63 @@ func (s *Supervisor) launch(ctx context.Context, record ConnectorRecord) (*child
 	if err != nil {
 		return nil, err
 	}
-	stdout, err := command.StdoutPipe()
+	// Own the read end so Wait cannot close it before buffered frames drain.
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
+		_ = stdin.Close()
 		return nil, err
 	}
+	command.Stdout = stdoutWriter
+	defer stdoutWriter.Close()
 	log, err := s.openLog(record.InstallationID)
 	if err != nil {
+		_ = stdout.Close()
+		_ = stdin.Close()
 		return nil, err
 	}
 	command.Stderr = log
 	if err := command.Start(); err != nil {
+		_ = stdout.Close()
+		_ = stdin.Close()
 		_ = log.Close()
 		return nil, err
 	}
+	_ = stdoutWriter.Close()
 	terminate, cleanup, err := containedCommandStarted(command)
 	if err != nil {
 		_ = command.Process.Kill()
 		_ = command.Wait()
+		_ = stdout.Close()
 		_ = log.Close()
 		return nil, err
 	}
-	child := &childProcess{id: record.InstallationID, command: command, input: stdin, encoder: protocol.NewChildEncoder(stdin), terminate: terminate, done: make(chan struct{}), processDone: make(chan error, 1), active: make(map[string]protocol.JobRequest)}
+	var containmentMu sync.Mutex
+	cleaned := false
+	child := &childProcess{id: record.InstallationID, command: command, input: stdin, encoder: protocol.NewChildEncoder(stdin), terminate: func() error {
+		containmentMu.Lock()
+		defer containmentMu.Unlock()
+		if cleaned {
+			return nil
+		}
+		return terminate()
+	}, done: make(chan struct{}), processDone: make(chan error, 1), outputDone: make(chan struct{}), active: make(map[string]protocol.JobRequest)}
 	go func() {
 		err := command.Wait()
+		// Parent exit must terminate descendants even while they hold stdout open.
+		containmentMu.Lock()
 		cleanup()
+		cleaned = true
+		containmentMu.Unlock()
+		_ = log.Close()
 		child.finish(err)
 		child.processDone <- err
+		close(child.processDone)
 	}()
 	decoder := protocol.NewChildDecoder(stdout)
 	first := make(chan error, 1)
 	go func() {
-		defer log.Close()
+		defer stdout.Close()
+		defer close(child.outputDone)
 		var envelope protocol.ChildEnvelope
 		if err := decoder.Decode(&envelope); err != nil {
 			first <- err
@@ -209,13 +247,22 @@ func (s *Supervisor) launch(ctx context.Context, record ConnectorRecord) (*child
 			case protocol.ChildMessageEvent:
 				job, ok := child.job(envelope.Event.AttemptToken)
 				if ok && s.sink != nil {
-					_ = s.sink.ConnectorEvent(s.ctx, child.id, job.JobID, *envelope.Event)
+					if err := s.sink.ConnectorEvent(s.ctx, child.id, job.JobID, *envelope.Event); err != nil {
+						child.finish(err)
+						_ = child.terminate()
+						return
+					}
 				}
 			case protocol.ChildMessageCompletion:
-				job, ok := child.removeJob(envelope.Completion.AttemptToken)
+				job, ok := child.job(envelope.Completion.AttemptToken)
 				if ok && s.sink != nil {
-					_ = s.sink.ConnectorCompletion(context.WithoutCancel(s.ctx), child.id, job.JobID, *envelope.Completion)
+					if err := s.sink.ConnectorCompletion(context.WithoutCancel(s.ctx), child.id, job.JobID, *envelope.Completion); err != nil {
+						child.finish(err)
+						_ = child.terminate()
+						return
+					}
 				}
+				child.removeJob(envelope.Completion.AttemptToken)
 			case protocol.ChildMessageReady:
 				child.setReady(*envelope.Ready)
 			default:
@@ -250,8 +297,8 @@ func (s *Supervisor) launch(ctx context.Context, record ConnectorRecord) (*child
 }
 
 func (s *Supervisor) watch(id string, child *childProcess) {
-	<-child.done
-	err := child.waitError()
+	defer s.watchers.Done()
+	err := s.settleChild(child)
 	if child.stopping.Load() || s.ctx.Err() != nil {
 		return
 	}
@@ -267,8 +314,14 @@ func (s *Supervisor) watch(id string, child *childProcess) {
 			return
 		case <-timer.C:
 		}
+		s.lifecycle.Lock()
+		if child.stopping.Load() || s.ctx.Err() != nil {
+			s.lifecycle.Unlock()
+			return
+		}
 		record, ok := s.store.Connector(id)
 		if !ok {
+			s.lifecycle.Unlock()
 			return
 		}
 		next, launchErr := s.launch(s.ctx, record)
@@ -276,17 +329,17 @@ func (s *Supervisor) watch(id string, child *childProcess) {
 			s.mu.Lock()
 			s.failures[id] = launchErr.Error()
 			s.mu.Unlock()
+			s.lifecycle.Unlock()
 			if backoff < time.Minute {
 				backoff *= 2
 			}
 			continue
 		}
 		s.mu.Lock()
-		installed := false
-		if s.children[id] == child {
+		installed := s.children[id] == child
+		if installed {
 			s.children[id] = next
 			delete(s.failures, id)
-			installed = true
 		}
 		s.mu.Unlock()
 		if !installed {
@@ -294,31 +347,76 @@ func (s *Supervisor) watch(id string, child *childProcess) {
 			stopCtx, cancel := context.WithTimeout(context.Background(), childStopTimeout)
 			_ = stopChild(stopCtx, next)
 			cancel()
+			s.lifecycle.Unlock()
 			return
 		}
 		child = next
-		<-child.done
-		err = child.waitError()
+		s.lifecycle.Unlock()
+		err = s.settleChild(child)
 		if child.stopping.Load() {
 			return
 		}
+		child.mu.Lock()
+		child.ready.Readiness, child.ready.Error = protocol.ReadinessOffline, err.Error()
+		child.mu.Unlock()
 		backoff = time.Second
 	}
 }
 
+func (s *Supervisor) settleChild(child *childProcess) error {
+	<-child.done
+	<-child.processDone
+	<-child.outputDone
+	err := child.waitError()
+	child.mu.RLock()
+	unfinished := make([]protocol.JobRequest, 0, len(child.active))
+	for _, job := range child.active {
+		unfinished = append(unfinished, job)
+	}
+	child.mu.RUnlock()
+	for _, job := range unfinished {
+		if s.sink != nil {
+			if sinkErr := s.sink.ConnectorCompletion(context.WithoutCancel(s.ctx), child.id, job.JobID, protocol.JobCompletion{AttemptToken: job.AttemptToken, Status: "error", Error: "connectorhost: child exited before reporting completion"}); sinkErr != nil {
+				err = errors.Join(err, sinkErr)
+			}
+		}
+		child.removeJob(job.AttemptToken)
+	}
+	return err
+}
+
 func (s *Supervisor) Stop(ctx context.Context, id string) error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
+	return s.stop(ctx, id)
+}
+
+func (s *Supervisor) stop(ctx context.Context, id string) error {
 	s.mu.Lock()
 	child := s.children[id]
-	delete(s.children, id)
 	s.mu.Unlock()
 	if child == nil {
 		return nil
 	}
-	return stopChild(ctx, child)
+	if err := stopChild(ctx, child); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.children[id] == child {
+		delete(s.children, id)
+		delete(s.failures, id)
+	}
+	s.mu.Unlock()
+	return nil
 }
 
 func stopChild(ctx context.Context, child *childProcess) error {
 	child.stopping.Store(true)
+	select {
+	case <-child.processDone:
+		return nil
+	default:
+	}
 	stopCtx, cancel := context.WithTimeout(ctx, childStopTimeout)
 	defer cancel()
 	child.mu.RLock()
@@ -362,7 +460,14 @@ func (s *Supervisor) Close(ctx context.Context) error {
 	for _, id := range ids {
 		result = errors.Join(result, s.Stop(ctx, id))
 	}
-	return result
+	done := make(chan struct{})
+	go func() { s.watchers.Wait(); close(done) }()
+	select {
+	case <-done:
+		return result
+	case <-ctx.Done():
+		return errors.Join(result, ctx.Err())
+	}
 }
 
 func (s *Supervisor) Dispatch(id string, job protocol.JobRequest) error {

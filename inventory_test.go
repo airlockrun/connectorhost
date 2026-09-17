@@ -11,10 +11,12 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/airlockrun/agentsdk/connector/protocol"
+	"github.com/google/uuid"
 )
 
 const (
@@ -98,19 +100,21 @@ func TestInventoryMutationLostResponseRetriesAndDoesNotBlockOthers(t *testing.T)
 	}
 	defer store.Close()
 	for _, id := range []string{inventoryID, otherInventoryID} {
-		if err := store.PutLocalConnector(inventoryTestRecord(id)); err != nil {
+		record := inventoryTestRecord(id)
+		record.Manifest.Interface.ContractID += "." + id
+		record.Manifest.InterfaceHash, err = protocol.InterfaceDigest(record.Manifest.Interface)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.PutLocalConnector(record); err != nil {
 			t.Fatal(err)
 		}
 	}
 	var mu sync.Mutex
 	requests := make(map[string][]protocol.HostConnectorInventoryMutationRequest)
 	failedOnce := false
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		var mutation protocol.HostConnectorInventoryMutationRequest
-		if request.URL.Path != "/api/hosts/v1/connectors/inventory" || request.Header.Get("Authorization") != "Bearer credential" || json.NewDecoder(request.Body).Decode(&mutation) != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
+	server := controlTestServer(t, func(message protocol.HostMessage) protocol.HostMessage {
+		mutation := *message.Inventory
 		mu.Lock()
 		requests[mutation.InstallationID] = append(requests[mutation.InstallationID], mutation)
 		fail := mutation.InstallationID == inventoryID && !failedOnce
@@ -119,16 +123,11 @@ func TestInventoryMutationLostResponseRetriesAndDoesNotBlockOthers(t *testing.T)
 		}
 		mu.Unlock()
 		if fail {
-			http.Error(w, "response lost", http.StatusInternalServerError)
-			return
+			return protocol.HostMessage{Error: &protocol.HostMessageError{Code: 500, Message: "response lost"}}
 		}
-		_ = json.NewEncoder(w).Encode(protocol.HostConnectorInventoryMutationResponse{InstallationID: mutation.InstallationID, AcknowledgedRevision: mutation.Revision})
-	}))
-	defer server.Close()
-	client, err := NewControlClient(server.URL, "credential", server.Client())
-	if err != nil {
-		t.Fatal(err)
-	}
+		return protocol.HostMessage{Inventoried: &protocol.HostConnectorInventoryMutationResponse{InstallationID: mutation.InstallationID, AcknowledgedRevision: mutation.Revision}}
+	})
+	client := connectTestClient(t, server)
 	host := newTestHost(store, server.Client())
 	host.flushInventoryMutations(t.Context(), client)
 	pending := store.PendingInventoryMutations()
@@ -250,19 +249,11 @@ func TestInventoryAcknowledgementRestartsWithPersistedStorageOrigins(t *testing.
 				waitForTestFile(t, spontaneousPath+".sent")
 			}
 			origins := []string{"https://storage.example"}
-			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				var mutation protocol.HostConnectorInventoryMutationRequest
-				if json.NewDecoder(request.Body).Decode(&mutation) != nil {
-					http.Error(w, "bad mutation", http.StatusBadRequest)
-					return
-				}
-				_ = json.NewEncoder(w).Encode(protocol.HostConnectorInventoryMutationResponse{InstallationID: mutation.InstallationID, AcknowledgedRevision: mutation.Revision, StorageOrigins: origins})
-			}))
-			defer server.Close()
-			client, err := NewControlClient(server.URL, "credential", server.Client())
-			if err != nil {
-				t.Fatal(err)
-			}
+			server := controlTestServer(t, func(message protocol.HostMessage) protocol.HostMessage {
+				mutation := *message.Inventory
+				return protocol.HostMessage{Inventoried: &protocol.HostConnectorInventoryMutationResponse{InstallationID: mutation.InstallationID, AcknowledgedRevision: mutation.Revision, StorageOrigins: origins}}
+			})
+			client := connectTestClient(t, server)
 			host.flushInventoryMutations(ctx, client)
 			waitForDifferentTestPID(t, pidPath, initialPID)
 			persisted, exists := store.Connector(inventoryID)
@@ -343,7 +334,7 @@ func waitForTestFile(t *testing.T, path string) {
 	}
 }
 
-func TestRemoteLifecycleDoesNotCreateLocalInventoryMutations(t *testing.T) {
+func TestRemoteInstallAndRemovalUseManagementInventory(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "instance"))
 	if err != nil {
 		t.Fatal(err)
@@ -368,6 +359,149 @@ func TestRemoteLifecycleDoesNotCreateLocalInventoryMutations(t *testing.T) {
 	}
 }
 
+func TestRemoteTransitionsReplayCompletionBeforeInventory(t *testing.T) {
+	for _, kind := range []protocol.HostWorkKind{protocol.HostWorkConnectorUpdate, protocol.HostWorkConnectorRollback} {
+		t.Run(string(kind), func(t *testing.T) {
+			root := t.TempDir()
+			store, err := OpenStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(executable)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = append(body, []byte("remote-update-regression")...)
+			candidatePath := filepath.Join(t.TempDir(), filepath.Base(executable))
+			if err := os.WriteFile(candidatePath, body, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			installer := NewArtifactInstaller(store, nil)
+			before, err := installer.StageLocal(t.Context(), LocalArtifactInput{InstallationID: inventoryID, SourcePath: executable, DisplayName: "Managed helper"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			after, err := installer.StageLocal(t.Context(), LocalArtifactInput{InstallationID: inventoryID, SourcePath: candidatePath, DisplayName: before.DisplayName})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if kind == protocol.HostWorkConnectorRollback {
+				before.PreviousDigest, before.PreviousFilename = after.ActiveDigest, after.Filename
+				before.PreviousSettings, before.PreviousManifest = after.Settings, &after.Manifest
+			}
+			if err := store.PutRemoteConnector(before); err != nil {
+				t.Fatal(err)
+			}
+			artifactServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(body) }))
+			defer artifactServer.Close()
+			jobID, token := uuid.NewString(), uuid.NewString()
+			var allowCompletion atomic.Bool
+			var loseInventory atomic.Bool
+			loseInventory.Store(true)
+			var mu sync.Mutex
+			var completions []protocol.HostManagementCompletion
+			var mutations []protocol.HostConnectorInventoryMutationRequest
+			server := controlTestServer(t, func(message protocol.HostMessage) protocol.HostMessage {
+				mu.Lock()
+				defer mu.Unlock()
+				if message.ManagementCompletion != nil {
+					completions = append(completions, *message.ManagementCompletion)
+					if !allowCompletion.Load() {
+						return protocol.HostMessage{}
+					}
+				}
+				if message.Inventory != nil {
+					mutations = append(mutations, *message.Inventory)
+					if loseInventory.Swap(false) {
+						return protocol.HostMessage{}
+					}
+					return protocol.HostMessage{Inventoried: &protocol.HostConnectorInventoryMutationResponse{InstallationID: inventoryID, AcknowledgedRevision: message.Inventory.Revision}}
+				}
+				return protocol.HostMessage{Ack: &struct{}{}}
+			})
+			t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
+			host := newTestHost(store, artifactServer.Client())
+			host.client = connectTestClient(t, server)
+			input, _ := json.Marshal(protocol.ConnectorArtifactInput{InstallationID: inventoryID, URL: artifactServer.URL, Filename: after.Filename, SHA256: after.ActiveDigest, SizeBytes: int64(len(body))})
+			host.handleManagement(t.Context(), kind, inventoryID, protocol.HostManagementJob{JobID: jobID, AttemptToken: token, Input: input, Deadline: time.Now().Add(time.Minute)})
+			pending := store.PendingInventoryMutations()
+			if len(pending) != 1 || pending[0].ManagementAttempt == nil || pending[0].ManagementAttempt.AttemptToken != token || pending[0].Active.MeasuredDigest != after.ActiveDigest || pending[0].Rollback == nil || pending[0].Rollback.MeasuredDigest != before.ActiveDigest {
+				t.Fatalf("activated inventory = %+v", pending)
+			}
+			if len(host.syncRequest().Connectors) != 0 {
+				t.Fatal("unacknowledged remote artifact entered compact sync")
+			}
+			host.flushInventoryMutations(t.Context(), host.client)
+			mu.Lock()
+			early := len(mutations)
+			mu.Unlock()
+			if early != 0 {
+				t.Fatal("inventory overtook lost completion acknowledgement")
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			if err := host.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			cancel()
+			host.client.Close()
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = OpenStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			host = newTestHost(store, server.Client())
+			defer func() {
+				ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+				defer stop()
+				if err := host.Close(ctx); err != nil {
+					t.Error(err)
+				}
+			}()
+			host.client = connectTestClient(t, server)
+			if err := host.supervisor.StartAll(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if len(host.syncRequest().Connectors) != 0 {
+				t.Fatal("restart lost inventory acknowledgement fence")
+			}
+			allowCompletion.Store(true)
+			host.flushManagementOutcomes(t.Context())
+			host.flushInventoryMutations(t.Context(), host.client)
+			if len(store.PendingInventoryMutations()) != 1 {
+				t.Fatal("lost inventory ACK discarded mutation")
+			}
+			host.client.Close()
+			if err := host.client.Connect(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			host.flushInventoryMutations(t.Context(), host.client)
+			if len(store.PendingInventoryMutations()) != 0 || len(host.syncRequest().Connectors) != 1 {
+				t.Fatal("acknowledged artifact did not become reportable")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(completions) != 2 || completions[0].Status != "success" || completions[0].InventoryRevision != pending[0].Revision {
+				t.Fatalf("completions = %+v", completions)
+			}
+			first, _ := json.Marshal(completions[0])
+			second, _ := json.Marshal(completions[1])
+			if string(first) != string(second) {
+				t.Fatal("completion replay changed its durable revision")
+			}
+			if len(mutations) != 2 || !inventoryMutationsEqual(mutations[0], mutations[1]) {
+				t.Fatalf("inventory replay changed: %+v", mutations)
+			}
+		})
+	}
+}
+
 func inventoryTestRecord(id string) ConnectorRecord {
 	manifest := helperManifest()
 	return ConnectorRecord{
@@ -378,5 +512,72 @@ func inventoryTestRecord(id string) ConnectorRecord {
 		Settings:       json.RawMessage(`{}`),
 		Manifest:       manifest,
 		InstalledAt:    time.Now().UTC(),
+	}
+}
+
+func TestRemoteTransitionRecoveryPreservesInventoryRevision(t *testing.T) {
+	for _, kind := range []protocol.HostWorkKind{protocol.HostWorkConnectorUpdate, protocol.HostWorkConnectorRollback} {
+		t.Run(string(kind), func(t *testing.T) {
+			root := t.TempDir()
+			store, err := OpenStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			executable, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := NewArtifactInstaller(store, nil).StageLocal(t.Context(), LocalArtifactInput{InstallationID: inventoryID, SourcePath: executable, DisplayName: "Managed", Settings: json.RawMessage(`{"slot":"before"}`)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before.PreviousDigest, before.PreviousFilename = before.ActiveDigest, before.Filename
+			previousManifest := before.Manifest
+			before.PreviousManifest, before.PreviousSettings = &previousManifest, json.RawMessage(`{"slot":"after"}`)
+			if err := store.PutRemoteConnector(before); err != nil {
+				t.Fatal(err)
+			}
+			attempt := protocol.ActiveAttempt{JobID: uuid.NewString(), AttemptToken: uuid.NewString()}
+			if err := store.saveManagementOutcome(managementOutcome{JobID: attempt.JobID, AttemptToken: attempt.AttemptToken, Kind: kind, ConnectorID: inventoryID, Status: "running", ConnectorExisted: true, ConnectorBefore: &before}); err != nil {
+				t.Fatal(err)
+			}
+			after := cloneRecord(before)
+			after.Settings, after.PreviousSettings = before.PreviousSettings, before.Settings
+			if err := store.PutRemoteTransition(after, attempt); err != nil {
+				t.Fatal(err)
+			}
+			revision := store.PendingInventoryMutations()[0].Revision
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = OpenStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
+			host := newTestHost(store, nil)
+			defer func() {
+				ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+				defer stop()
+				if err := host.Close(ctx); err != nil {
+					t.Error(err)
+				}
+			}()
+			if err := host.recoverInterruptedManagement(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			outcome, found, err := store.loadManagementOutcome(attempt.JobID)
+			if err != nil || !found || outcome.Status != "success" || outcome.InventoryRevision != revision {
+				t.Fatalf("recovered transition = %+v, %v", outcome, err)
+			}
+			pending := store.PendingInventoryMutations()
+			if len(pending) != 1 || pending[0].Revision != revision || pending[0].ManagementAttempt == nil || *pending[0].ManagementAttempt != attempt {
+				t.Fatalf("recovery changed inventory fence: %+v", pending)
+			}
+			if len(host.syncRequest().Connectors) != 0 {
+				t.Fatal("recovery advertised unacknowledged metadata")
+			}
+		})
 	}
 }

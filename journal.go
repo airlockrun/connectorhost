@@ -15,18 +15,19 @@ import (
 const managementOutcomeVersion = 2
 
 type managementOutcome struct {
-	Version          int                   `json:"version"`
-	JobID            string                `json:"jobId"`
-	AttemptToken     string                `json:"attemptToken"`
-	Kind             protocol.HostWorkKind `json:"kind"`
-	ConnectorID      string                `json:"connectorId,omitempty"`
-	Status           string                `json:"status"`
-	Output           json.RawMessage       `json:"output,omitempty"`
-	Error            string                `json:"error,omitempty"`
-	ProcessID        int                   `json:"processId,omitempty"`
-	UpdatedAt        time.Time             `json:"updatedAt"`
-	ConnectorExisted bool                  `json:"connectorExisted,omitempty"`
-	ConnectorBefore  *ConnectorRecord      `json:"connectorBefore,omitempty"`
+	InventoryRevision uint64                `json:"inventoryRevision,omitempty"`
+	Version           int                   `json:"version"`
+	JobID             string                `json:"jobId"`
+	AttemptToken      string                `json:"attemptToken"`
+	Kind              protocol.HostWorkKind `json:"kind"`
+	ConnectorID       string                `json:"connectorId,omitempty"`
+	Status            string                `json:"status"`
+	Output            json.RawMessage       `json:"output,omitempty"`
+	Error             string                `json:"error,omitempty"`
+	ProcessID         int                   `json:"processId,omitempty"`
+	UpdatedAt         time.Time             `json:"updatedAt"`
+	ConnectorExisted  bool                  `json:"connectorExisted,omitempty"`
+	ConnectorBefore   *ConnectorRecord      `json:"connectorBefore,omitempty"`
 }
 
 func (s *Store) loadManagementOutcome(jobID string) (managementOutcome, bool, error) {

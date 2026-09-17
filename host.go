@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 )
 
 type Host struct {
+	outputFailure      chan error
+	outboxMu           sync.Mutex
 	store              *Store
 	installer          *ArtifactInstaller
 	supervisor         *Supervisor
@@ -42,7 +45,7 @@ func NewHost(store *Store, httpClient *http.Client, logger *slog.Logger) *Host {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	host := &Host{store: store, httpClient: httpClient, logger: logger, credentialsReady: make(chan struct{}, 1), stateChanged: make(chan struct{}, 1), activeManagement: make(map[string]protocol.ActiveAttempt)}
+	host := &Host{store: store, httpClient: httpClient, logger: logger, credentialsReady: make(chan struct{}, 1), stateChanged: make(chan struct{}, 1), activeManagement: make(map[string]protocol.ActiveAttempt), outputFailure: make(chan error, 1)}
 	host.installer = NewArtifactInstaller(store, httpClient)
 	host.supervisor = NewSupervisor(store, host)
 	return host
@@ -79,6 +82,8 @@ func (h *Host) ServeControl(ctx context.Context, controlPort int) error {
 }
 
 func (h *Host) serveRemote(ctx context.Context) error {
+	ctx, stopHost := context.WithCancel(ctx)
+	defer stopHost()
 	baseURL, credential, err := h.waitForCredentials(ctx)
 	if err != nil {
 		return err
@@ -92,6 +97,7 @@ func (h *Host) serveRemote(ctx context.Context) error {
 	h.clientMu.Unlock()
 	h.logger.Info("control plane configured", "host_id", h.store.HostID())
 	defer func() {
+		stopHost()
 		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		_ = h.supervisor.Close(stopCtx)
@@ -105,101 +111,150 @@ func (h *Host) serveRemote(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	heartbeat := 30 * time.Second
-	syncFailing := false
-	pollFailing := false
-	firstSync := true
 	for {
-		h.recoverManagementOutcomes(ctx)
-		h.flushManagementOutcomes(ctx)
-		mutationCtx, mutationCancel := context.WithTimeout(ctx, 10*time.Second)
-		h.flushInventoryMutations(mutationCtx, client)
-		mutationCancel()
-		syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		response, err := client.Sync(syncCtx, h.syncRequest())
+		select {
+		case err := <-h.outputFailure:
+			return err
+		default:
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		sessionCtx, cancel := context.WithCancel(ctx)
+		err := client.Connect(sessionCtx)
+		if err == nil {
+			err = h.runSession(ctx, sessionCtx, client)
+		}
 		cancel()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			if !syncFailing {
-				h.logger.Warn("host synchronization failed")
-				syncFailing = true
-			}
-			if err := sleepContext(ctx, time.Second); err != nil {
-				return nil
-			}
-			continue
+		client.Close()
+		if ctx.Err() != nil {
+			return nil
 		}
-		if syncFailing {
-			h.logger.Info("host synchronization recovered")
-			syncFailing = false
-		}
-		if response.HostID != "" && response.HostID != h.store.HostID() {
-			if err := h.store.SetCredentials(baseURL, credential, response.HostID); err != nil {
-				return err
-			}
-		}
-		if firstSync {
-			h.logger.Info("host synchronized", "host_id", response.HostID, "access_mode", h.store.AccessMode(), "connectors", len(h.store.Connectors()))
-			firstSync = false
-		}
-		h.retryConnectorStartup(ctx)
-		if response.HeartbeatSeconds >= 5 && response.HeartbeatSeconds <= 3600 {
-			heartbeat = time.Duration(response.HeartbeatSeconds) * time.Second
-		}
-		pollDeadline := heartbeat
-		if response.LongPollSeconds > 0 && response.LongPollSeconds <= 300 {
-			pollDeadline = time.Duration(response.LongPollSeconds+5) * time.Second
-		}
-		work, pollErr, stateChanged := h.poll(ctx, client, pollDeadline)
-		if stateChanged {
-			continue
-		}
-		if pollErr != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			if !pollFailing {
-				h.logger.Warn("host work poll failed")
-				pollFailing = true
-			}
-			continue
-		}
-		if pollFailing {
-			h.logger.Info("host work polling recovered")
-			pollFailing = false
-		}
-		for _, item := range work.Work {
-			h.handleWork(ctx, item)
+		h.logger.Warn("host session disconnected", "error", err)
+		if sleepContext(ctx, time.Second) != nil {
+			return nil
 		}
 	}
 }
 
-type hostPollResult struct {
-	response protocol.HostPollResponse
-	err      error
-}
-
-func (h *Host) poll(ctx context.Context, client *ControlClient, deadline time.Duration) (protocol.HostPollResponse, error, bool) {
-	pollCtx, cancel := context.WithTimeout(ctx, deadline)
+func (h *Host) runSession(hostCtx, sessionCtx context.Context, client *ControlClient) error {
+	ctx, cancel := context.WithCancel(sessionCtx)
 	defer cancel()
-	result := make(chan hostPollResult, 1)
+	syncCtx, stop := context.WithTimeout(ctx, 15*time.Second)
+	response, err := client.Sync(syncCtx, h.syncRequest())
+	stop()
+	if err != nil {
+		return err
+	}
+	if response.HostID != h.store.HostID() {
+		baseURL, credential := h.store.Credentials()
+		if err := h.store.SetCredentials(baseURL, credential, response.HostID); err != nil {
+			return err
+		}
+	}
+	result := make(chan error, 5)
+	var workers sync.WaitGroup
+	defer workers.Wait()
+	defer cancel()
+	workers.Add(5)
 	go func() {
-		response, err := client.Poll(pollCtx, protocol.HostPollRequest{ActiveManagementAttempts: h.managementAttempts(), ActiveConnectorAttempts: h.activeAttempts()})
-		result <- hostPollResult{response: response, err: err}
+		defer workers.Done()
+		for {
+			if err := h.flushConnectorOutcomes(ctx); err != nil {
+				h.logger.Error("connector output delivery pending", "error", err)
+			}
+			if sleepContext(ctx, time.Second) != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for {
+			attempts, err := h.activeAttempts()
+			if err != nil {
+				result <- err
+				return
+			}
+			work, err := client.Demand(ctx, max(0, protocol.MaxHostConnectorClaims-len(attempts)))
+			if err != nil {
+				result <- err
+				return
+			}
+			if work != nil {
+				h.handleWork(hostCtx, *work)
+				if work.Kind == protocol.HostWorkConnectorCancel && sleepContext(ctx, 100*time.Millisecond) != nil {
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			attempts, err := h.activeAttempts()
+			if err != nil {
+				result <- err
+				return
+			}
+			heartbeatCtx, stop := context.WithTimeout(ctx, 10*time.Second)
+			err = client.Heartbeat(heartbeatCtx, protocol.HostHeartbeat{AccessMode: h.store.AccessMode(), ActiveManagementAttempts: h.managementAttempts(), ActiveConnectorAttempts: attempts})
+			stop()
+			if err != nil {
+				result <- err
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		for {
+			h.recoverManagementOutcomes(ctx)
+			h.flushManagementOutcomes(ctx)
+			mutationCtx, stop := context.WithTimeout(ctx, 10*time.Second)
+			h.flushInventoryMutations(mutationCtx, client)
+			stop()
+			h.retryConnectorStartup(hostCtx)
+			if sleepContext(ctx, 20*time.Second) != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer workers.Done()
+		ticker := time.NewTicker(20 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			case <-h.stateChanged:
+			}
+			syncCtx, stop := context.WithTimeout(ctx, 15*time.Second)
+			_, err := client.Sync(syncCtx, h.syncRequest())
+			stop()
+			if err != nil {
+				result <- err
+				return
+			}
+		}
 	}()
 	select {
-	case completed := <-result:
-		return completed.response, completed.err, false
-	case <-h.stateChanged:
-		cancel()
-		<-result
-		return protocol.HostPollResponse{}, nil, true
+	case err := <-result:
+		return err
+	case err := <-h.outputFailure:
+		h.outputFailure <- err
+		return err
 	case <-ctx.Done():
-		cancel()
-		<-result
-		return protocol.HostPollResponse{}, ctx.Err(), false
+		return ctx.Err()
 	}
 }
 
@@ -252,17 +307,17 @@ func (h *Host) retryConnectorStartup(ctx context.Context) {
 }
 
 func (h *Host) syncRequest() protocol.HostSyncRequest {
-	h.managementMu.Lock()
-	defer h.managementMu.Unlock()
 	name, _ := os.Hostname()
-	acknowledged := make(map[string]bool)
+	acknowledged := make(map[string]string)
 	for _, record := range h.store.Connectors() {
-		acknowledged[record.InstallationID] = record.InventoryAcknowledged
+		if record.InventoryAcknowledged {
+			acknowledged[record.InstallationID] = record.ActiveDigest
+		}
 	}
 	statuses := h.supervisor.Statuses()
 	connectors := statuses[:0]
 	for _, status := range statuses {
-		if acknowledged[status.InstallationID] {
+		if digest, ok := acknowledged[status.InstallationID]; ok && digest == status.Manifest.ArtifactDigest {
 			connectors = append(connectors, status)
 		}
 	}
@@ -282,11 +337,19 @@ func (h *Host) flushInventoryMutations(ctx context.Context, client *ControlClien
 		go func() {
 			defer wait.Done()
 			for mutation := range work {
+				if mutation.ManagementAttempt != nil {
+					_, found, err := h.store.loadManagementOutcome(mutation.ManagementAttempt.JobID)
+					if err != nil || found {
+						continue
+					}
+				}
 				response, err := client.InventoryMutation(ctx, mutation)
 				if err != nil {
 					continue
 				}
-				h.managementMu.Lock()
+				if !h.managementMu.TryLock() {
+					continue
+				}
 				before, existed := h.store.Connector(mutation.InstallationID)
 				record, applied, err := h.store.AcknowledgeInventoryMutation(mutation, response)
 				if err == nil && applied && mutation.Kind == protocol.HostConnectorMutationUpsert && (!existed || !slices.Equal(before.StorageOrigins, record.StorageOrigins)) {
@@ -311,12 +374,44 @@ func (h *Host) flushInventoryMutations(ctx context.Context, client *ControlClien
 	wait.Wait()
 }
 
-func (h *Host) activeAttempts() []protocol.ActiveAttempt {
+func (h *Host) activeAttempts() ([]protocol.ActiveAttempt, error) {
+	h.outboxMu.Lock()
+	defer h.outboxMu.Unlock()
 	var result []protocol.ActiveAttempt
+	seen := make(map[string]bool)
 	for _, status := range h.supervisor.Statuses() {
-		result = append(result, status.ActiveAttempts...)
+		for _, attempt := range status.ActiveAttempts {
+			result = append(result, attempt)
+			seen[attempt.AttemptToken] = true
+		}
 	}
-	return result
+	directory := filepath.Join(h.store.root, "outbox")
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return result, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), "-terminal.json") {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			return nil, err
+		}
+		message, err := protocol.DecodeHostMessage(body)
+		if err != nil || message.ConnectorCompletion == nil {
+			return nil, errors.Join(errors.New("connectorhost: corrupt completion outbox"), err)
+		}
+		completion := message.ConnectorCompletion
+		if !seen[completion.Completion.AttemptToken] {
+			result = append(result, protocol.ActiveAttempt{JobID: completion.JobID, AttemptToken: completion.Completion.AttemptToken})
+			seen[completion.Completion.AttemptToken] = true
+		}
+	}
+	return result, nil
 }
 
 func (h *Host) handleWork(ctx context.Context, work protocol.HostWork) {
@@ -329,11 +424,9 @@ func (h *Host) handleWork(ctx context.Context, work protocol.HostWork) {
 		if err := h.supervisor.Dispatch(work.ConnectorID, *work.ConnectorJob); err != nil {
 			h.logger.Warn("connector command dispatch failed", "connector_id", work.ConnectorID, "job_id", work.ConnectorJob.JobID)
 			completion := protocol.JobCompletion{AttemptToken: work.ConnectorJob.AttemptToken, Status: "error", Error: err.Error()}
-			completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
-			_ = retryControl(completionCtx, func(ctx context.Context) error {
-				return h.controlClient().ConnectorCompletion(ctx, work.ConnectorID, work.ConnectorJob.JobID, completion)
-			})
-			cancel()
+			if err := h.ConnectorCompletion(ctx, work.ConnectorID, work.ConnectorJob.JobID, completion); err != nil {
+				h.logger.Error("persist dispatch outcome", "error", err)
+			}
 		}
 	case protocol.HostWorkConnectorCancel:
 		if work.Cancel != nil {
@@ -410,11 +503,25 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 				return
 			}
 		}
+		if journal.Status == "success" && journal.InventoryRevision != 0 && journal.AttemptToken != completion.AttemptToken {
+			// A replacement attempt must bind its inventory to the new delivery fence.
+			current, exists := h.store.Connector(connectorID)
+			if !exists {
+				sendCompletion = false
+				return
+			}
+			if err := h.store.PutRemoteTransition(current, protocol.ActiveAttempt{JobID: job.JobID, AttemptToken: job.AttemptToken}); err != nil {
+				sendCompletion = false
+				return
+			}
+			journal.InventoryRevision = h.remoteInventoryRevision(connectorID, job.JobID)
+		}
 		journal.AttemptToken = job.AttemptToken
 		if err := h.store.saveManagementOutcome(journal); err != nil {
 			sendCompletion = false
 			return
 		}
+		completion.InventoryRevision = journal.InventoryRevision
 		completion.Status, completion.Output, completion.Error = journal.Status, journal.Output, journal.Error
 		return
 	}
@@ -460,13 +567,21 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 				err = errors.New("connectorhost: management connector ID does not match artifact input")
 			} else {
 				input.InstallationID = connectorID
-				err = h.installRemote(ctx, input, kind == protocol.HostWorkConnectorUpdate)
+				persist := h.store.PutRemoteConnector
+				if kind == protocol.HostWorkConnectorUpdate {
+					persist = func(record ConnectorRecord) error {
+						return h.store.PutRemoteTransition(record, protocol.ActiveAttempt{JobID: job.JobID, AttemptToken: job.AttemptToken})
+					}
+				}
+				err = h.installRemote(ctx, input, kind == protocol.HostWorkConnectorUpdate, persist)
 			}
 		}
 	case protocol.HostWorkConnectorRemove:
 		err = h.remove(ctx, connectorID, false)
 	case protocol.HostWorkConnectorRollback:
-		err = h.rollback(ctx, connectorID, false)
+		err = h.rollback(ctx, connectorID, func(record ConnectorRecord) error {
+			return h.store.PutRemoteTransition(record, protocol.ActiveAttempt{JobID: job.JobID, AttemptToken: job.AttemptToken})
+		})
 	default:
 		err = fmt.Errorf("connectorhost: unsupported management work %q", kind)
 	}
@@ -484,6 +599,14 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 		return
 	}
 	completion.Status = "success"
+	if kind == protocol.HostWorkConnectorUpdate || kind == protocol.HostWorkConnectorRollback {
+		journal.InventoryRevision = h.remoteInventoryRevision(connectorID, job.JobID)
+		completion.InventoryRevision = journal.InventoryRevision
+		if journal.InventoryRevision == 0 {
+			sendCompletion = false
+			return
+		}
+	}
 	if output != nil {
 		completion.Output, err = json.Marshal(output)
 		if err != nil {
@@ -505,7 +628,7 @@ func (h *Host) flushManagementOutcomes(ctx context.Context) {
 		if outcome.Status == "running" {
 			continue
 		}
-		completion := protocol.HostManagementCompletion{JobID: outcome.JobID, AttemptToken: outcome.AttemptToken, Status: outcome.Status, Output: outcome.Output, Error: outcome.Error}
+		completion := protocol.HostManagementCompletion{JobID: outcome.JobID, AttemptToken: outcome.AttemptToken, Status: outcome.Status, Output: outcome.Output, Error: outcome.Error, InventoryRevision: outcome.InventoryRevision}
 		requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := h.controlClient().ManagementCompletion(requestCtx, completion)
 		cancel()
@@ -560,7 +683,7 @@ func (h *Host) recoverInterruptedManagement(ctx context.Context) error {
 				}
 			}
 		case protocol.HostWorkConnectorUpdate:
-			activated := outcome.ConnectorBefore != nil && exists && current.ActiveDigest != outcome.ConnectorBefore.ActiveDigest
+			activated := outcome.ConnectorBefore != nil && exists && h.remoteInventoryRevision(outcome.ConnectorID, outcome.JobID) != 0
 			if activated {
 				if startErr := h.supervisor.Start(ctx, outcome.ConnectorID); startErr == nil {
 					outcome.Status, outcome.Error = "success", ""
@@ -601,6 +724,12 @@ func (h *Host) recoverInterruptedManagement(ctx context.Context) error {
 		default:
 			outcome.Error = "connectorhost: unsupported interrupted management operation"
 		}
+		if outcome.Status == "success" && (outcome.Kind == protocol.HostWorkConnectorUpdate || outcome.Kind == protocol.HostWorkConnectorRollback) {
+			outcome.InventoryRevision = h.remoteInventoryRevision(outcome.ConnectorID, outcome.JobID)
+			if outcome.InventoryRevision == 0 {
+				return errors.New("connectorhost: recovered management transition has no durable inventory")
+			}
+		}
 		if err := h.store.saveManagementOutcome(outcome); err != nil {
 			return err
 		}
@@ -612,9 +741,18 @@ func rollbackSlotsSwapped(current, before ConnectorRecord) bool {
 	return before.PreviousManifest != nil && current.PreviousManifest != nil &&
 		current.ActiveDigest == before.PreviousDigest && current.PreviousDigest == before.ActiveDigest &&
 		current.Filename == before.PreviousFilename && current.PreviousFilename == before.Filename &&
-		bytes.Equal(current.Settings, before.PreviousSettings) && bytes.Equal(current.PreviousSettings, before.Settings) &&
+		settingsEqual(current.Settings, before.PreviousSettings) && settingsEqual(current.PreviousSettings, before.Settings) &&
 		slices.Equal(current.StorageOrigins, before.PreviousStorageOrigins) && slices.Equal(current.PreviousStorageOrigins, before.StorageOrigins) &&
 		manifestsEqual(current.Manifest, *before.PreviousManifest) && manifestsEqual(*current.PreviousManifest, before.Manifest)
+}
+
+func settingsEqual(left, right json.RawMessage) bool {
+	if bytes.Equal(left, right) {
+		return true
+	}
+	leftJSON, leftErr := protocol.CanonicalJSON(left)
+	rightJSON, rightErr := protocol.CanonicalJSON(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
 func manifestsEqual(left, right protocol.Manifest) bool {
@@ -623,13 +761,16 @@ func manifestsEqual(left, right protocol.Manifest) bool {
 	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
 }
 
-func (h *Host) Install(ctx context.Context, input protocol.ConnectorArtifactInput, update bool) error {
-	h.managementMu.Lock()
-	defer h.managementMu.Unlock()
-	return h.installRemote(ctx, input, update)
+func (h *Host) remoteInventoryRevision(connectorID, jobID string) uint64 {
+	for _, mutation := range h.store.PendingInventoryMutations() {
+		if mutation.InstallationID == connectorID && mutation.ManagementAttempt != nil && mutation.ManagementAttempt.JobID == jobID {
+			return mutation.Revision
+		}
+	}
+	return 0
 }
 
-func (h *Host) installRemote(ctx context.Context, input protocol.ConnectorArtifactInput, update bool) error {
+func (h *Host) installRemote(ctx context.Context, input protocol.ConnectorArtifactInput, update bool, persist func(ConnectorRecord) error) error {
 	if err := validateHostStorageOrigins(input.StorageOrigins); err != nil {
 		return fmt.Errorf("connectorhost: artifact storage origins: %w", err)
 	}
@@ -661,7 +802,7 @@ func (h *Host) installRemote(ctx context.Context, input protocol.ConnectorArtifa
 		previousManifest := old.Manifest
 		record.PreviousManifest = &previousManifest
 	}
-	if err := h.supervisor.Activate(ctx, record, func() error { return h.store.PutRemoteConnector(record) }); err != nil {
+	if err := h.supervisor.Activate(ctx, record, func() error { return persist(record) }); err != nil {
 		restoreErr := h.store.rewriteCurrentState()
 		if exists {
 			restoreErr = errors.Join(restoreErr, h.supervisor.Start(context.Background(), old.InstallationID))
@@ -688,6 +829,10 @@ func (h *Host) remove(ctx context.Context, id string, local bool) error {
 		}
 	}
 	if _, exists := h.store.Connector(id); !exists {
+		if !local {
+			// A failed install can reserve a server slot without a local record.
+			return h.supervisor.Stop(ctx, id)
+		}
 		return fmt.Errorf("connectorhost: connector %q is not installed", id)
 	}
 	if local && !h.store.CanEnqueueInventoryMutation(id) {
@@ -712,14 +857,12 @@ func (h *Host) remove(ctx context.Context, id string, local bool) error {
 func (h *Host) Rollback(ctx context.Context, id string) error {
 	h.managementMu.Lock()
 	defer h.managementMu.Unlock()
-	return h.rollback(ctx, id, true)
+	return h.rollback(ctx, id, h.store.PutLocalConnector)
 }
 
-func (h *Host) rollback(ctx context.Context, id string, local bool) error {
-	if local {
-		if err := validateInventoryInstallationID(id); err != nil {
-			return err
-		}
+func (h *Host) rollback(ctx context.Context, id string, persist func(ConnectorRecord) error) error {
+	if err := validateInventoryInstallationID(id); err != nil {
+		return err
 	}
 	record, exists := h.store.Connector(id)
 	if !exists {
@@ -734,13 +877,7 @@ func (h *Host) rollback(ctx context.Context, id string, local bool) error {
 	record.StorageOrigins, record.PreviousStorageOrigins = record.PreviousStorageOrigins, record.StorageOrigins
 	currentManifest := record.Manifest
 	record.Manifest, record.PreviousManifest = *record.PreviousManifest, &currentManifest
-	persist := func() error {
-		if local {
-			return h.store.PutLocalConnector(record)
-		}
-		return h.store.PutRemoteConnector(record)
-	}
-	if err := h.supervisor.Activate(ctx, record, persist); err != nil {
+	if err := h.supervisor.Activate(ctx, record, func() error { return persist(record) }); err != nil {
 		restoreErr := h.store.rewriteCurrentState()
 		restoreErr = errors.Join(restoreErr, h.supervisor.Start(context.Background(), id))
 		h.cleanupFailedCandidate(record, record)
@@ -859,9 +996,7 @@ func (h *Host) CleanupStaging() {
 }
 
 func (h *Host) ConnectorEvent(ctx context.Context, connectorID, jobID string, event protocol.JobEvent) error {
-	return retryControl(ctx, func(ctx context.Context) error {
-		return h.controlClient().ConnectorEvent(ctx, connectorID, jobID, event)
-	})
+	return h.enqueueOutcome(protocol.HostMessage{ConnectorEvent: &protocol.HostConnectorEvent{ConnectorID: connectorID, JobID: jobID, Event: event}}, jobID, event.AttemptToken, fmt.Sprintf("%020d", event.Sequence))
 }
 func (h *Host) ConnectorCompletion(ctx context.Context, connectorID, jobID string, completion protocol.JobCompletion) error {
 	if completion.Status == "success" {
@@ -869,9 +1004,7 @@ func (h *Host) ConnectorCompletion(ctx context.Context, connectorID, jobID strin
 	} else {
 		h.logger.Warn("connector command completed", "connector_id", connectorID, "job_id", jobID, "status", completion.Status)
 	}
-	return retryControl(ctx, func(ctx context.Context) error {
-		return h.controlClient().ConnectorCompletion(ctx, connectorID, jobID, completion)
-	})
+	return h.enqueueOutcome(protocol.HostMessage{ConnectorCompletion: &protocol.HostConnectorCompletion{ConnectorID: connectorID, JobID: jobID, Completion: completion}}, jobID, completion.AttemptToken, "terminal")
 }
 func (h *Host) controlClient() *ControlClient {
 	h.clientMu.RLock()

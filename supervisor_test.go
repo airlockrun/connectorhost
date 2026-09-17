@@ -74,6 +74,40 @@ func TestChildCancellationWritesHonorShutdownDeadline(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("blocked cancellation returned after %s", elapsed)
 	}
+	supervisor.mu.RLock()
+	retained := supervisor.children[record.InstallationID] == child
+	supervisor.mu.RUnlock()
+	if !retained {
+		t.Fatal("failed stop discarded child before exit was confirmed")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if err := supervisor.Stop(context.Background(), record.InstallationID); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stop retry did not confirm process exit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestActivateRejectsDuplicateBeforeLaunch(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first := inventoryTestRecord(inventoryID)
+	if err := store.PutConnector(first); err != nil {
+		t.Fatal(err)
+	}
+	supervisor := NewSupervisor(store, nil)
+	duplicate := inventoryTestRecord(otherInventoryID)
+	err = supervisor.Activate(t.Context(), duplicate, func() error { t.Fatal("duplicate reached persistence"); return nil })
+	if err == nil || !strings.Contains(err.Error(), "duplicate installations") {
+		t.Fatalf("admission must precede executable lookup and launch: %v", err)
+	}
 }
 
 func TestConnectorDescendantsTerminateWithChild(t *testing.T) {
@@ -106,6 +140,99 @@ func TestConnectorDescendantsTerminateWithChild(t *testing.T) {
 	}
 	if processRunning(pid) {
 		t.Fatalf("connector descendant %d remains running", pid)
+	}
+}
+
+type drainingSink struct {
+	event   chan struct{}
+	release chan struct{}
+	completionSink
+}
+
+func (s *drainingSink) ConnectorEvent(context.Context, string, string, protocol.JobEvent) error {
+	close(s.event)
+	<-s.release
+	return nil
+}
+
+func TestParentExitCleansDescendantBeforeDrainingBufferedCompletion(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	record := stageSupervisorTestConnector(t, store, "parent-exit", json.RawMessage(`{}`))
+	if err := store.PutConnector(record); err != nil {
+		t.Fatal(err)
+	}
+	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
+	t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
+	t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_DESCENDANT_PATH", pidPath)
+	t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_EXIT_AFTER_JOB", "1")
+	sink := &drainingSink{event: make(chan struct{}), release: make(chan struct{}), completionSink: completionSink{done: make(chan protocol.JobCompletion, 2)}}
+	supervisor := NewSupervisor(store, sink)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := supervisor.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	}()
+	defer func() {
+		select {
+		case <-sink.release:
+		default:
+			close(sink.release)
+		}
+	}()
+	if err := supervisor.Start(t.Context(), record.InstallationID); err != nil {
+		t.Fatal(err)
+	}
+	pid := waitForTestPID(t, pidPath)
+	supervisor.mu.RLock()
+	child := supervisor.children[record.InstallationID]
+	supervisor.mu.RUnlock()
+	if err := supervisor.Dispatch(record.InstallationID, protocol.JobRequest{JobID: "job", AttemptToken: "attempt", Input: json.RawMessage(`{}`), Deadline: time.Now().Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-sink.event:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child did not emit progress")
+	}
+	select {
+	case <-child.processDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("parent exit waited for descendant stdout EOF")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for processRunning(pid) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if processRunning(pid) {
+		t.Fatal("parent exit did not clean up descendant")
+	}
+	close(sink.release)
+	select {
+	case completion := <-sink.done:
+		if completion.Status != "success" {
+			t.Fatalf("buffered terminal frame lost: %+v", completion)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("buffered completion did not drain")
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		supervisor.mu.RLock()
+		restarted := supervisor.children[record.InstallationID] != child
+		supervisor.mu.RUnlock()
+		if restarted {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("parent exit did not recover connector")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

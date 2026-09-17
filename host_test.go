@@ -6,52 +6,107 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/airlockrun/agentsdk/connector/protocol"
 )
 
-func TestPollStopsWhenAccessModeChanges(t *testing.T) {
-	started := make(chan struct{})
-	release := make(chan struct{})
-	server := httptest.NewTLSServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		close(started)
-		<-release
-	}))
-	t.Cleanup(func() {
-		close(release)
-		server.Close()
-	})
-	client, err := NewControlClient(server.URL, "credential", server.Client())
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestManagementSurvivesSessionReconnect(t *testing.T) {
 	store, err := OpenStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	host := NewHost(store, server.Client(), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	result := make(chan bool, 1)
-	go func() {
-		_, _, changed := host.poll(context.Background(), client, time.Minute)
-		result <- changed
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := filepath.Join(t.TempDir(), "release-shell")
+	input, err := json.Marshal(protocol.ShellInput{Command: executable, Environment: map[string]string{"AIRLOCK_CONNECTOR_HOST_TEST_SHELL_GATE": gate}, MaxOutputBytes: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var delivered atomic.Bool
+	synced := make(chan struct{}, 10)
+	completed := make(chan protocol.HostManagementCompletion, 10)
+	server := controlTestServer(t, func(m protocol.HostMessage) protocol.HostMessage {
+		switch {
+		case m.Sync != nil:
+			synced <- struct{}{}
+			return protocol.HostMessage{Synced: &protocol.HostSyncResponse{HostID: "host", HeartbeatSeconds: 20}}
+		case m.Demand != nil:
+			if delivered.CompareAndSwap(false, true) {
+				return protocol.HostMessage{Work: &protocol.HostWork{Kind: protocol.HostWorkShell, ManagementJob: &protocol.HostManagementJob{JobID: "shell", AttemptToken: "attempt", Input: input, Deadline: time.Now().Add(30 * time.Second)}}}
+			}
+			time.Sleep(10 * time.Millisecond)
+		case m.ManagementCompletion != nil:
+			completed <- *m.ManagementCompletion
+		}
+		return protocol.HostMessage{Ack: &struct{}{}}
+	})
+	if err := store.SetCredentials(server.URL, "credential", "host"); err != nil {
+		t.Fatal(err)
+	}
+	host := newTestHost(store, server.Client())
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- host.serveRemote(ctx) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("host shutdown hung")
+		}
 	}()
-	<-started
-	if err := host.SetAccessMode(AccessNone); err != nil {
+	select {
+	case <-synced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial sync missing")
+	}
+	waitForTestPID(t, gate+".started")
+	host.controlClient().Close()
+	select {
+	case <-synced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("host did not reconnect")
+	}
+	if attempts := host.managementAttempts(); len(attempts) != 1 || attempts[0].AttemptToken != "attempt" {
+		t.Fatalf("reconnect lost admitted management: %+v", attempts)
+	}
+	if err := os.WriteFile(gate, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case changed := <-result:
-		if !changed {
-			t.Fatal("poll did not report an access mode change")
+	case result := <-completed:
+		if result.Status != "success" || result.AttemptToken != "attempt" {
+			t.Fatalf("session disconnect canceled shell: %+v", result)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("poll did not stop after an access mode change")
+	case <-time.After(10 * time.Second):
+		t.Fatal("shell did not complete across reconnect")
+	}
+}
+
+func TestRemoteRemovalConfirmsAbsentInstallation(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	host := NewHost(store, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := host.remove(t.Context(), inventoryID, false); err != nil {
+		t.Fatalf("remote removal of failed install: %v", err)
+	}
+	if err := host.Remove(t.Context(), inventoryID); err == nil {
+		t.Fatal("local removal of unknown installation succeeded")
 	}
 }
 

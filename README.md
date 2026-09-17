@@ -99,14 +99,49 @@ signature and trust root.
 
 ## Control plane
 
-The host uses bearer authentication and rejects redirects for all control-plane
-requests under `/api/hosts/v1`: `sync`, `work/poll`, connector job events and
-completion, inventory mutation, and management events and completion. Inventory
-mutations use `/api/hosts/v1/connectors/inventory`, and acknowledged upserts
-persist Airlock-authorized storage origins and restart the connector from that
-persisted configuration while the host daemon remains available.
-Enrollment uses
-`/api/hosts/v1/enroll/device-code` and `/api/hosts/v1/enroll/complete`.
+The host opens one outbound WSS connection at `/api/hosts/v1/connect` using its
+bearer credential and the `airlock.host.v2` WebSocket subprotocol. Every JSON
+message carries that exact protocol identity, a correlation ID, and exactly one
+typed payload. Unknown fields, incompatible versions, oversized messages, and
+queue overflow close the session. The host rejects redirects.
+
+The session multiplexes sync, inventory mutations, heartbeat/lease renewal,
+progress, completions, and work demand. A host has at most one outstanding demand;
+each delivery consumes that demand. Airlock bounds active connector claims to 32
+per host in the database, and serializes management work per host. A ten-second
+heartbeat renews explicit attempt-token pairs independently of the twenty-second
+inventory sync. Dispatch does not trigger an inventory sync. Inventory mutation
+acknowledgements persist authorized storage origins and restart the connector
+from persisted configuration.
+
+Child stdout writes a durable `outbox/` queue bounded to 512 entries and 64 MiB,
+with capacity reserved for terminal outcomes. Network delivery runs separately.
+Completions remain in the queue and lease-renewal reports until acknowledged;
+reconnection and restart replay their exact payloads. Airlock persists completion
+receipts so an identical latest-attempt completion can be acknowledged after its
+lease or deadline. Changed outcomes and superseded attempts are rejected.
+Explicitly rejected output is logged and retained in `outbox/*.rejected` for
+operator inspection, independently of pending queue capacity. Rejected retention
+is bounded to 128 files and 16 MiB; oldest payloads are removed with a warning.
+Local persistence failures stop the host instead of losing
+outcomes silently. Management outcomes and inventory revisions have their own
+durable journals.
+
+Remote updates and rollbacks atomically enqueue their complete active/rollback
+inventory with the job-attempt fence. The successful management journal records
+that revision. Completion acknowledgement precedes inventory delivery, and the
+new artifact enters compact sync only after inventory acknowledgement. Both
+acknowledgements can be retried after reconnect or process restart without
+reapplying the lifecycle operation.
+
+Admitted management runs use the host lifetime and their job deadline, not the
+connection lifetime. Reconnecting does not cancel running shell or lifecycle
+work. Cancellation notices alternate fairly with new work claims so an
+unresponsive connector cannot block other host work.
+
+Only enrollment uses HTTPS requests at `/api/hosts/v1/enroll/device-code` and
+`/api/hosts/v1/enroll/complete`. Runtime HTTP polling endpoints are not exposed.
+Reverse proxies must support WebSocket upgrades and long-lived connections.
 
 The host binary has no self-update path. Update `airlock-host` through the
 machine's external package or service manager.

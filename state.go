@@ -137,9 +137,17 @@ func (s *Store) load() error {
 		if (mutation.Kind == protocol.HostConnectorMutationUpsert) != exists {
 			return errors.New("connectorhost: pending inventory mutation does not match connector state")
 		}
-		if exists && !inventoryMutationsEqual(mutation, inventoryUpsertMutation(*s.state.Connectors[id], mutation.Revision)) {
+		expected := protocol.HostConnectorInventoryMutationRequest{}
+		if exists {
+			expected = inventoryUpsertMutation(*s.state.Connectors[id], mutation.Revision)
+			expected.ManagementAttempt = mutation.ManagementAttempt
+		}
+		if exists && !inventoryMutationsEqual(mutation, expected) {
 			return errors.New("connectorhost: pending inventory upsert does not match connector state")
 		}
+	}
+	if err := validateSingletonContracts(s.state.Connectors); err != nil {
+		return err
 	}
 	if migrated {
 		return s.saveLocked()
@@ -273,6 +281,15 @@ func (s *Store) PutRemoteConnector(record ConnectorRecord) error {
 }
 
 func (s *Store) PutLocalConnector(record ConnectorRecord) error {
+	return s.putInventoryConnector(record, nil)
+}
+
+// PutRemoteTransition atomically persists activation and its completion-fenced inventory.
+func (s *Store) PutRemoteTransition(record ConnectorRecord, attempt protocol.ActiveAttempt) error {
+	return s.putInventoryConnector(record, &attempt)
+}
+
+func (s *Store) putInventoryConnector(record ConnectorRecord, attempt *protocol.ActiveAttempt) error {
 	if err := validateConnectorRecord(record); err != nil {
 		return err
 	}
@@ -292,6 +309,10 @@ func (s *Store) PutLocalConnector(record ConnectorRecord) error {
 		return err
 	}
 	mutation := inventoryUpsertMutation(record, revision)
+	mutation.ManagementAttempt = attempt
+	if attempt != nil {
+		record.InventoryAcknowledged = false
+	}
 	if err := protocol.ValidateHostConnectorInventoryMutationRequest(mutation); err != nil {
 		return err
 	}
@@ -465,12 +486,49 @@ func (s *Store) rewriteCurrentState() error {
 }
 
 func (s *Store) saveStateLocked(state persistedState) error {
+	for id, mutation := range s.state.PendingInventoryMutations {
+		if mutation.Kind == protocol.HostConnectorMutationRemove && state.Connectors[id] != nil {
+			return fmt.Errorf("connectorhost: installation %q has a pending removal acknowledgement; install with a new installation ID", id)
+		}
+	}
+	if err := validateSingletonContracts(state.Connectors); err != nil {
+		return err
+	}
 	body, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
 	body = append(body, '\n')
 	return atomicWrite(filepath.Join(s.root, "host.json"), body, 0o600)
+}
+
+func validateSingletonContracts(records map[string]*ConnectorRecord) error {
+	contracts := make(map[string]string, len(records))
+	for id, record := range records {
+		contract := record.Manifest.Interface.ContractID
+		if contract == "" {
+			continue
+		}
+		if existing, exists := contracts[contract]; exists {
+			return fmt.Errorf("connectorhost: contract %q has duplicate installations %q and %q; stop and remove duplicates before starting the host, or update the existing installation", contract, existing, id)
+		}
+		contracts[contract] = id
+	}
+	return nil
+}
+
+func (s *Store) admitConnector(record ConnectorRecord) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if mutation, pending := s.state.PendingInventoryMutations[record.InstallationID]; pending && mutation.Kind == protocol.HostConnectorMutationRemove {
+		return fmt.Errorf("connectorhost: installation %q has a pending removal acknowledgement; install with a new installation ID", record.InstallationID)
+	}
+	if current, exists := s.state.Connectors[record.InstallationID]; exists && current.Manifest.Interface.ContractID != record.Manifest.Interface.ContractID {
+		return errors.New("connectorhost: an installation's contract ID cannot change; remove it before installing another contract")
+	}
+	candidate := cloneConnectors(s.state.Connectors)
+	candidate[record.InstallationID] = &record
+	return validateSingletonContracts(candidate)
 }
 
 func cloneConnectors(connectors map[string]*ConnectorRecord) map[string]*ConnectorRecord {

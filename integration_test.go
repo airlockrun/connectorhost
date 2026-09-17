@@ -28,6 +28,15 @@ func TestMain(main *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "__airlock_shell" {
 		os.Exit(RunShellHelper(os.Args[2:], os.Stdin, os.Stdout, os.Stderr))
 	}
+	if path := os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_SHELL_GATE"); path != "" {
+		_ = os.WriteFile(path+".started", []byte(strconv.Itoa(os.Getpid())), 0o600)
+		for {
+			if _, err := os.Stat(path); err == nil {
+				os.Exit(0)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 	if len(os.Args) == 2 && os.Args[1] == "manifest" {
 		if path := os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_MANIFEST_DESCENDANT_PATH"); path != "" {
 			command := exec.Command(os.Args[0])
@@ -176,6 +185,7 @@ func runHelperChild() {
 	if path := os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_DESCENDANT_PATH"); path != "" {
 		command := exec.Command(os.Args[0])
 		command.Env = append(os.Environ(), "AIRLOCK_CONNECTOR_HOST_TEST_DESCENDANT=1")
+		command.Stdout, command.Stderr = os.Stdout, os.Stderr
 		if command.Start() == nil {
 			_ = os.WriteFile(path, []byte(strconv.Itoa(command.Process.Pid)), 0o600)
 			_ = command.Process.Release()
@@ -228,7 +238,13 @@ func runHelperChild() {
 				continue
 			}
 			completion := protocol.JobCompletion{AttemptToken: envelope.Job.AttemptToken, Status: "success", Output: json.RawMessage(`{}`)}
+			if os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_EXIT_AFTER_JOB") == "1" {
+				_ = encoder.Encode(protocol.ChildEnvelope{Type: protocol.ChildMessageEvent, Event: &protocol.JobEvent{AttemptToken: envelope.Job.AttemptToken, Sequence: 1, Phase: "finishing", Time: time.Now()}})
+			}
 			_ = encoder.Encode(protocol.ChildEnvelope{Type: protocol.ChildMessageCompletion, Completion: &completion})
+			if os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_EXIT_AFTER_JOB") == "1" {
+				return
+			}
 		}
 	}
 }
