@@ -59,7 +59,7 @@ func TestUnenrolledHostStaysAvailableAndEnrollsThroughLocalControl(t *testing.T)
 	}
 
 	var prompt EnrollmentPrompt
-	if err := client.Enroll(t.Context(), airlock.URL, AccessUpdateOnly, func(value EnrollmentPrompt) error {
+	if err := client.Enroll(t.Context(), airlock.URL, AccessUpdates, func(value EnrollmentPrompt) error {
 		prompt = value
 		return nil
 	}); err != nil {
@@ -72,13 +72,13 @@ func TestUnenrolledHostStaysAvailableAndEnrollsThroughLocalControl(t *testing.T)
 	if baseURL != airlock.URL || credential != "credential-1" || store.HostID() != "host-1" {
 		t.Fatalf("credentials = %q / %q / %q", baseURL, credential, store.HostID())
 	}
-	if store.AccessMode() != AccessUpdateOnly {
+	if store.AccessMode() != AccessUpdates {
 		t.Fatalf("access mode = %q", store.AccessMode())
 	}
 	if err := client.Enroll(t.Context(), airlock.URL, AccessNone, func(EnrollmentPrompt) error { return nil }); err == nil {
 		t.Fatal("already-enrolled host accepted another enrollment")
 	}
-	if store.AccessMode() != AccessUpdateOnly {
+	if store.AccessMode() != AccessUpdates {
 		t.Fatalf("failed enrollment changed access mode to %q", store.AccessMode())
 	}
 	select {
@@ -122,7 +122,7 @@ func TestFailedEnrollmentPreservesAccessMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := store.SetAccessMode(AccessUpdateOnly); err != nil {
+	if err := store.SetAccessMode(AccessUpdates); err != nil {
 		t.Fatal(err)
 	}
 	err = EnrollWithPrompt(t.Context(), store, airlock.URL, AccessNone, airlock.Client(), func(EnrollmentPrompt) error { return nil })
@@ -132,7 +132,7 @@ func TestFailedEnrollmentPreservesAccessMode(t *testing.T) {
 	if requestedMode != AccessNone {
 		t.Fatalf("requested mode = %q", requestedMode)
 	}
-	if store.AccessMode() != AccessUpdateOnly {
+	if store.AccessMode() != AccessUpdates {
 		t.Fatalf("failed enrollment changed access mode to %q", store.AccessMode())
 	}
 }

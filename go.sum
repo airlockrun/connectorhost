@@ -1,5 +1,5 @@
-github.com/airlockrun/agentsdk v0.7.0-rc.3 h1:rdrRhZJOjQe60Z4AjS8uIQpMXUcU2x9x/o50Ofo6k2I=
-github.com/airlockrun/agentsdk v0.7.0-rc.3/go.mod h1:d1z4PTFhp4NMHhqa7wKYlX/NwRYEwI41l8L2oQYlR4Q=
+github.com/airlockrun/agentsdk v0.7.0-rc.5 h1:CllsCJADqZKOKkwiD+Wk6N5UGLSeMp6GAii1OXdHEWM=
+github.com/airlockrun/agentsdk v0.7.0-rc.5/go.mod h1:d1z4PTFhp4NMHhqa7wKYlX/NwRYEwI41l8L2oQYlR4Q=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=

@@ -1,7 +1,7 @@
 package connectorhost
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/airlockrun/agentsdk/connector/protocol"
 )
@@ -9,18 +9,19 @@ import (
 type AccessMode = protocol.RemoteAccessMode
 
 const (
-	AccessFull       = protocol.RemoteAccessFull
-	AccessUpdateOnly = protocol.RemoteAccessUpdateOnly
-	AccessNone       = protocol.RemoteAccessNone
+	AccessFull    = protocol.RemoteAccessFull
+	AccessManage  = protocol.RemoteAccessManage
+	AccessUpdates = protocol.RemoteAccessUpdates
+	AccessNone    = protocol.RemoteAccessNone
 )
 
 func ParseAccessMode(value string) (AccessMode, error) {
 	mode := AccessMode(value)
 	switch mode {
-	case AccessFull, AccessUpdateOnly, AccessNone:
+	case AccessFull, AccessManage, AccessUpdates, AccessNone:
 		return mode, nil
 	default:
-		return "", fmt.Errorf("connectorhost: access mode must be full, update_only, or none")
+		return "", errors.New("connectorhost: access mode must be full, manage, updates, or none")
 	}
 }
 
@@ -28,7 +29,9 @@ func AllowsRemoteManagement(mode AccessMode, kind protocol.HostWorkKind, existin
 	switch mode {
 	case AccessFull:
 		return kind == protocol.HostWorkShell || kind == protocol.HostWorkConnectorInstall || kind == protocol.HostWorkConnectorUpdate || kind == protocol.HostWorkConnectorRemove || kind == protocol.HostWorkConnectorRollback
-	case AccessUpdateOnly:
+	case AccessManage:
+		return kind == protocol.HostWorkConnectorInstall || kind == protocol.HostWorkConnectorUpdate || kind == protocol.HostWorkConnectorRemove || kind == protocol.HostWorkConnectorRollback
+	case AccessUpdates:
 		return existing && (kind == protocol.HostWorkConnectorUpdate || kind == protocol.HostWorkConnectorRollback)
 	default:
 		return false

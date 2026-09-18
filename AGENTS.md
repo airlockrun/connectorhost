@@ -8,6 +8,8 @@
 - Each nonempty contract ID occupies one installation per state root, independent of artifact version or readiness. Admission precedes activation; removal releases the slot only after the child stops. Duplicate persisted contracts prevent startup with an actionable error.
 - An installation ID awaiting removal acknowledgement cannot be reused. Admission and persistence preserve its removal tombstone; replacement installs use a new ID.
 - Remote responses cannot modify the locally persisted access mode.
+- Remote access defaults to `full` (shell and all connector lifecycle operations). `manage` permits install, update, rollback, and remove without shell, including removal of an already absent installation. `updates` permits only update and rollback of existing installations; `none` permits no remote management. Unknown modes and operations fail closed.
+- Local connector lifecycle commands remain available in every access mode.
 - Connector jobs are not management work and remain allowed in every access mode.
 - Artifact activation requires exact HTTPS, size, SHA-256, manifest, and readiness verification.
 - Updates retain a complete prior artifact and settings slot; the host has no self-update feature.

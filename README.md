@@ -19,9 +19,9 @@ trusted Airlock builds and protect the host account as one trust domain.
 ## CLI
 
 ```text
-airlock-host [--user] enroll --airlock https://airlock.example [--mode full|update_only|none]
+airlock-host [--user] enroll --airlock https://airlock.example [--mode full|manage|updates|none]
 airlock-host [--user | --state-dir DIR] access get
-airlock-host [--user | --state-dir DIR] access set full|update_only|none
+airlock-host [--user | --state-dir DIR] access set full|manage|updates|none
 airlock-host [--user | --state-dir DIR] connector list
 airlock-host [--user | --state-dir DIR] connector status [ID] [--json]
 airlock-host [--user | --state-dir DIR] connector install ./connector [--name NAME] [--settings settings.json] [--sha256 HEX]
@@ -29,8 +29,8 @@ airlock-host [--user | --state-dir DIR] connector update ID ./connector [--setti
 airlock-host [--user | --state-dir DIR] connector rollback ID
 airlock-host [--user | --state-dir DIR] connector remove ID
 airlock-host [--user] service install|start|stop|status|uninstall
-airlock-host [--user] service enroll --airlock https://airlock.example [--mode full|update_only|none]
-airlock-host --state-dir DIR enroll --airlock https://airlock.example [--mode full|update_only|none]
+airlock-host [--user] service enroll --airlock https://airlock.example [--mode full|manage|updates|none]
+airlock-host --state-dir DIR enroll --airlock https://airlock.example [--mode full|manage|updates|none]
 airlock-host --state-dir DIR serve [--control-port PORT]
 ```
 
@@ -61,7 +61,8 @@ their connector directories are deleted. A new local installation enters
 compact heartbeat only after its first inventory upsert is acknowledged.
 
 - `full` allows remote shell, install, remove, update, and rollback.
-- `update_only` allows update and rollback of existing installations.
+- `manage` allows remote install, update, rollback, and remove, but no shell. Removal is allowed even when the installation is already absent.
+- `updates` allows update and rollback of existing installations.
 - `none` rejects all remote management.
 - Ordinary connector jobs and cancellations are independent of management mode.
 
@@ -158,11 +159,11 @@ checksum and installing the package, enroll the machine:
 sudo airlock-host enroll --airlock https://airlock.example
 ```
 
-The interactive flow asks for `full`, `update_only`, or `none`. Noninteractive
-enrollment must select it directly, for example:
+The interactive flow offers `full` (1), `manage` (2), `updates` (3),
+and `none` (4). Noninteractive enrollment must select it directly, for example:
 
 ```sh
-sudo airlock-host enroll --airlock https://airlock.example --mode update_only
+sudo airlock-host enroll --airlock https://airlock.example --mode updates
 ```
 
 The running service waits for explicit enrollment before connecting to Airlock.

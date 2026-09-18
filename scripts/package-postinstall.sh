@@ -35,7 +35,11 @@ case "$manager_state" in
 esac
 
 if [ "$is_upgrade" = true ]; then
-  enabled_state="$(systemctl is-enabled airlock-host.service 2>/dev/null || true)"
+  if [ -e "$unit" ]; then
+    enabled_state="$(systemctl is-enabled airlock-host.service 2>/dev/null || true)"
+  else
+    enabled_state=not-found
+  fi
   case "$enabled_state" in
     enabled|enabled-runtime) was_enabled=true ;;
     disabled|not-found|static|indirect|generated|transient|linked|linked-runtime|alias) ;;

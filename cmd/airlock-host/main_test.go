@@ -37,11 +37,15 @@ func TestAccessCommandUsesControlServerWhenStoreIsLocked(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- server.Serve(ctx) }()
 	var stdout, stderr bytes.Buffer
-	if err := run([]string{"--state-dir", root, "access", "set", "none"}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
-		t.Fatal(err)
-	}
-	if store.AccessMode() != connectorhost.AccessNone {
-		t.Fatalf("access mode = %q", store.AccessMode())
+	for _, mode := range []connectorhost.AccessMode{connectorhost.AccessFull, connectorhost.AccessManage, connectorhost.AccessUpdates, connectorhost.AccessNone} {
+		t.Run(string(mode), func(t *testing.T) {
+			if err := run([]string{"--state-dir", root, "access", "set", string(mode)}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
+				t.Fatal(err)
+			}
+			if store.AccessMode() != mode {
+				t.Fatalf("access mode = %q", store.AccessMode())
+			}
+		})
 	}
 	cancel()
 	if err := <-result; err != nil {
@@ -73,7 +77,7 @@ func TestManagedCommandsUseManagedServiceState(t *testing.T) {
 func TestAccessCommandFallsBackToDirectStore(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "instance")
 	var stdout, stderr bytes.Buffer
-	if err := run([]string{"--state-dir", root, "access", "set", "update_only"}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
+	if err := run([]string{"--state-dir", root, "access", "set", "manage"}, bytes.NewReader(nil), &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
 	store, err := connectorhost.OpenStore(root)
@@ -81,7 +85,7 @@ func TestAccessCommandFallsBackToDirectStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if store.AccessMode() != connectorhost.AccessUpdateOnly {
+	if store.AccessMode() != connectorhost.AccessManage {
 		t.Fatalf("access mode = %q", store.AccessMode())
 	}
 }
@@ -163,18 +167,51 @@ func TestMutatingControlLostResponseIsNotReplayed(t *testing.T) {
 }
 
 func TestEnrollmentModeFlagAndPrompt(t *testing.T) {
-	mode, err := selectEnrollmentMode("update_only", bytes.NewReader(nil), io.Discard, false)
-	if err != nil || mode != connectorhost.AccessUpdateOnly {
-		t.Fatalf("flag mode = %q, %v", mode, err)
+	for _, test := range []struct {
+		number string
+		mode   connectorhost.AccessMode
+	}{
+		{"1", connectorhost.AccessFull},
+		{"2", connectorhost.AccessManage},
+		{"3", connectorhost.AccessUpdates},
+		{"4", connectorhost.AccessNone},
+	} {
+		t.Run(string(test.mode), func(t *testing.T) {
+			mode, err := selectEnrollmentMode(string(test.mode), bytes.NewReader(nil), io.Discard, false)
+			if err != nil || mode != test.mode {
+				t.Fatalf("flag mode = %q, %v", mode, err)
+			}
+			for _, input := range []string{test.number, string(test.mode)} {
+				mode, err := selectEnrollmentMode("", strings.NewReader(input+"\n"), io.Discard, true)
+				if err != nil || mode != test.mode {
+					t.Fatalf("prompt %q = %q, %v", input, mode, err)
+				}
+			}
+		})
 	}
 
 	var output bytes.Buffer
-	mode, err = selectEnrollmentMode("", bytes.NewBufferString("invalid\n3\n"), &output, true)
+	mode, err := selectEnrollmentMode("", bytes.NewBufferString("invalid\n4\n"), &output, true)
 	if err != nil || mode != connectorhost.AccessNone {
 		t.Fatalf("prompt mode = %q, %v", mode, err)
 	}
-	if !strings.Contains(output.String(), "connector jobs still run") || !strings.Contains(output.String(), "Enter 1, 2, 3") {
-		t.Fatalf("prompt output = %q", output.String())
+	for _, text := range []string{"1) full", "2) Manage", "3) Updates", "4) none", "no shell", "connector jobs still run", "Enter 1, 2, 3, 4", "Mode [1/2/3/4]"} {
+		if !strings.Contains(output.String(), text) {
+			t.Fatalf("prompt lacks %q: %q", text, output.String())
+		}
+	}
+	for _, value := range []string{"manage_connectors", "update_only", "manage-connectors", "Manage", "Updates", " manage "} {
+		t.Run("invalid/"+value, func(t *testing.T) {
+			if _, err := selectEnrollmentMode(value, bytes.NewReader(nil), io.Discard, false); err == nil {
+				t.Fatal("invalid flag accepted")
+			}
+			if err := accessCommand(t.TempDir(), []string{"set", value}, io.Discard); err == nil {
+				t.Fatal("invalid access command accepted")
+			}
+		})
+	}
+	if _, err := selectEnrollmentMode("", bytes.NewReader(nil), io.Discard, true); err == nil {
+		t.Fatal("EOF selected a mode")
 	}
 }
 

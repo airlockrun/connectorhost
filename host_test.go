@@ -110,6 +110,45 @@ func TestRemoteRemovalConfirmsAbsentInstallation(t *testing.T) {
 	}
 }
 
+func TestRemoteManagementAbsentRemovalPolicy(t *testing.T) {
+	for _, mode := range []AccessMode{AccessFull, AccessManage, AccessUpdates, AccessNone} {
+		t.Run(string(mode), func(t *testing.T) {
+			store, err := OpenStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if err := store.SetAccessMode(mode); err != nil {
+				t.Fatal(err)
+			}
+			completed := make(chan protocol.HostManagementCompletion, 1)
+			server := controlTestServer(t, func(message protocol.HostMessage) protocol.HostMessage {
+				if message.ManagementCompletion != nil {
+					completed <- *message.ManagementCompletion
+				}
+				return protocol.HostMessage{Ack: &struct{}{}}
+			})
+			host := newTestHost(store, server.Client())
+			host.client = connectTestClient(t, server)
+			host.handleManagement(t.Context(), protocol.HostWorkConnectorRemove, inventoryID, protocol.HostManagementJob{
+				JobID: "remove", AttemptToken: "attempt", Deadline: time.Now().Add(5 * time.Second),
+			})
+			select {
+			case completion := <-completed:
+				if mode == AccessFull || mode == AccessManage {
+					if completion.Status != "success" || completion.Error != "" {
+						t.Fatalf("absent removal failed: %+v", completion)
+					}
+				} else if completion.Status != "error" || !strings.Contains(completion.Error, "local access policy denied") {
+					t.Fatalf("absent removal not denied: %+v", completion)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("missing management completion")
+			}
+		})
+	}
+}
+
 func TestAccessModeChangeIsLoggedAndWakesRemoteSync(t *testing.T) {
 	store, err := OpenStore(t.TempDir())
 	if err != nil {

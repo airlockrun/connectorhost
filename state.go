@@ -17,7 +17,7 @@ import (
 	"github.com/airlockrun/agentsdk/connector/protocol"
 )
 
-const stateVersion = 2
+const stateVersion = 3
 
 var ErrStateLocked = errors.New("connectorhost: state directory is locked")
 
@@ -102,8 +102,15 @@ func (s *Store) load() error {
 				record.InventoryAcknowledged = true
 			}
 		}
-		s.state.Version = stateVersion
+		s.state.Version = 2
 		s.state.PendingInventoryMutations = make(map[string]protocol.HostConnectorInventoryMutationRequest)
+		migrated = true
+	}
+	if s.state.Version == 2 {
+		if s.state.AccessMode == "update_only" {
+			s.state.AccessMode = AccessUpdates
+		}
+		s.state.Version = stateVersion
 		migrated = true
 	}
 	if s.state.Version != stateVersion || s.state.Connectors == nil {

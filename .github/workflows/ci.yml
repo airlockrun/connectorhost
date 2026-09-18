@@ -112,6 +112,15 @@ jobs:
             exit 1
           fi
 
+          sudo airlock-host service uninstall
+          [[ ! -e /etc/systemd/system/airlock-host.service ]]
+          sudo dpkg --install "${packages[0]}"
+          [[ "$(sudo airlock-host service status)" == stopped ]]
+          if systemctl is-enabled --quiet airlock-host.service; then
+            echo "::error::uninstalled service was re-enabled during upgrade"
+            exit 1
+          fi
+
           sudo systemctl enable airlock-host.service
           sudo airlock-host service start
           before_upgrade="$(sudo airlock-host service status)"

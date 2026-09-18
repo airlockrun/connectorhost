@@ -3,8 +3,10 @@ package connectorhost
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -167,7 +169,7 @@ func TestStoreDefaultsFullPersistsAndLocks(t *testing.T) {
 	if _, err := OpenStore(root); !errors.Is(err, ErrStateLocked) {
 		t.Fatalf("second store lock error = %v", err)
 	}
-	if err := store.SetAccessMode(AccessUpdateOnly); err != nil {
+	if err := store.SetAccessMode(AccessUpdates); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.SetCredentials("https://airlock.example", "secret", "host-1"); err != nil {
@@ -181,7 +183,7 @@ func TestStoreDefaultsFullPersistsAndLocks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if store.AccessMode() != AccessUpdateOnly || store.HostID() != "host-1" {
+	if store.AccessMode() != AccessUpdates || store.HostID() != "host-1" {
 		t.Fatalf("reloaded state = %q / %q", store.AccessMode(), store.HostID())
 	}
 	info, err := os.Stat(filepath.Join(root, "host.json"))
@@ -190,6 +192,135 @@ func TestStoreDefaultsFullPersistsAndLocks(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
 		t.Fatalf("state mode = %o", info.Mode().Perm())
+	}
+}
+
+func TestStoreAccessModesPersist(t *testing.T) {
+	for _, mode := range []AccessMode{AccessFull, AccessManage, AccessUpdates, AccessNone} {
+		t.Run(string(mode), func(t *testing.T) {
+			root := t.TempDir()
+			store, err := OpenStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SetAccessMode(mode); err != nil {
+				t.Fatal(err)
+			}
+			for _, invalid := range []AccessMode{"unknown", "update_only", "manage_connectors"} {
+				if err := store.SetAccessMode(invalid); err == nil {
+					t.Fatalf("invalid mode %q accepted", invalid)
+				}
+			}
+			if store.AccessMode() != mode {
+				t.Fatal("invalid mode changed state")
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = OpenStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if store.AccessMode() != mode {
+				t.Fatalf("reloaded mode = %q, want %q", store.AccessMode(), mode)
+			}
+		})
+	}
+}
+
+func TestStoreAccessModeMigration(t *testing.T) {
+	for _, version := range []int{1, 2} {
+		for _, mode := range []AccessMode{AccessFull, "update_only", AccessNone} {
+			t.Run(fmt.Sprintf("v%d/%s", version, mode), func(t *testing.T) {
+				root := t.TempDir()
+				record := inventoryTestRecord(inventoryID)
+				record.PreviousDigest = record.ActiveDigest
+				record.PreviousFilename = record.Filename
+				record.PreviousSettings = record.Settings
+				record.PreviousManifest = &record.Manifest
+				state := persistedState{
+					Version: version, AccessMode: mode, HostID: "host-1",
+					AirlockURL: "https://airlock.example", Credential: "secret",
+					Connectors:                map[string]*ConnectorRecord{inventoryID: &record},
+					PendingInventoryMutations: make(map[string]protocol.HostConnectorInventoryMutationRequest),
+				}
+				if version == 2 {
+					state.MutationRevision = 7
+					state.PendingInventoryMutations[inventoryID] = inventoryUpsertMutation(record, 6)
+					state.PendingInventoryMutations[otherInventoryID] = protocol.HostConnectorInventoryMutationRequest{
+						InstallationID: otherInventoryID, Revision: 7, Kind: protocol.HostConnectorMutationRemove,
+					}
+				}
+				body, err := json.Marshal(state)
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(root, "host.json")
+				if err := os.WriteFile(path, body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				state.Version = stateVersion
+				if mode == "update_only" {
+					state.AccessMode = AccessUpdates
+				}
+				if version == 1 {
+					record.InventoryAcknowledged = true
+				}
+				for range 2 {
+					store, err := OpenStore(root)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if !reflect.DeepEqual(store.state, state) {
+						t.Error("migration changed state beyond version, mode, and v1 inventory acknowledgement")
+					}
+					if err := store.Close(); err != nil {
+						t.Fatal(err)
+					}
+					body, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var persisted persistedState
+					if err := json.Unmarshal(body, &persisted); err != nil {
+						t.Fatal(err)
+					}
+					if persisted.Version != stateVersion || persisted.AccessMode != state.AccessMode {
+						t.Fatal("migration was not persisted")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestStoreRejectsInvalidPersistedAccessMode(t *testing.T) {
+	for _, version := range []int{1, 2, stateVersion} {
+		for _, mode := range []AccessMode{"manage_connectors", "unknown", "update_only"} {
+			if version < stateVersion && mode == "update_only" {
+				continue
+			}
+			t.Run(fmt.Sprintf("v%d/%s", version, mode), func(t *testing.T) {
+				root := t.TempDir()
+				body, err := json.Marshal(persistedState{Version: version, AccessMode: mode, Connectors: map[string]*ConnectorRecord{}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(root, "host.json")
+				if err := os.WriteFile(path, body, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if store, err := OpenStore(root); err == nil {
+					store.Close()
+					t.Fatal("invalid persisted mode accepted")
+				}
+				persisted, err := os.ReadFile(path)
+				if err != nil || string(persisted) != string(body) {
+					t.Fatalf("failed migration modified state: %v", err)
+				}
+			})
+		}
 	}
 }
 

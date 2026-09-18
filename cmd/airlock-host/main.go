@@ -160,7 +160,7 @@ func parseEnrollmentOptions(command string, args []string, stdin io.Reader, stdo
 	set := flag.NewFlagSet(command, flag.ContinueOnError)
 	set.SetOutput(stderr)
 	airlockURL := set.String("airlock", "", "Airlock HTTPS origin")
-	modeValue := set.String("mode", "", "remote management mode: full, update_only, or none")
+	modeValue := set.String("mode", "", "remote management mode: full, manage, updates, or none")
 	if err := set.Parse(args); err != nil {
 		return "", "", err
 	}
@@ -182,15 +182,16 @@ func selectEnrollmentMode(value string, input io.Reader, output io.Writer, inter
 		return connectorhost.ParseAccessMode(value)
 	}
 	if !interactive {
-		return "", errors.New("airlock-host: enrollment requires --mode full|update_only|none when input is not interactive")
+		return "", errors.New("airlock-host: enrollment requires --mode full|manage|updates|none when input is not interactive")
 	}
 	_, _ = fmt.Fprintln(output, "Select the remote management mode for this host:")
-	_, _ = fmt.Fprintln(output, "  1) full        allow install, update, remove, rollback, and shell")
-	_, _ = fmt.Fprintln(output, "  2) update_only allow update and rollback of existing connectors")
-	_, _ = fmt.Fprintln(output, "  3) none        disable remote management; connector jobs still run")
+	_, _ = fmt.Fprintln(output, "  1) full    allow install, update, remove, rollback, and shell")
+	_, _ = fmt.Fprintln(output, "  2) Manage  allow install, update, remove, and rollback; no shell")
+	_, _ = fmt.Fprintln(output, "  3) Updates allow update and rollback of existing connectors")
+	_, _ = fmt.Fprintln(output, "  4) none    disable remote management; connector jobs still run")
 	scanner := bufio.NewScanner(input)
 	for {
-		_, _ = fmt.Fprint(output, "Mode [1/2/3]: ")
+		_, _ = fmt.Fprint(output, "Mode [1/2/3/4]: ")
 		if !scanner.Scan() {
 			if err := scanner.Err(); err != nil {
 				return "", err
@@ -200,12 +201,14 @@ func selectEnrollmentMode(value string, input io.Reader, output io.Writer, inter
 		switch strings.TrimSpace(scanner.Text()) {
 		case "1", "full":
 			return connectorhost.AccessFull, nil
-		case "2", "update_only":
-			return connectorhost.AccessUpdateOnly, nil
-		case "3", "none":
+		case "2", "manage":
+			return connectorhost.AccessManage, nil
+		case "3", "updates":
+			return connectorhost.AccessUpdates, nil
+		case "4", "none":
 			return connectorhost.AccessNone, nil
 		default:
-			_, _ = fmt.Fprintln(output, "Enter 1, 2, 3, full, update_only, or none.")
+			_, _ = fmt.Fprintln(output, "Enter 1, 2, 3, 4, full, manage, updates, or none.")
 		}
 	}
 }
@@ -255,7 +258,7 @@ func accessCommand(root string, args []string, stdout io.Writer) error {
 				return err
 			})
 	}
-	return errors.New("airlock-host: access requires get or set <full|update_only|none>")
+	return errors.New("airlock-host: access requires get or set <full|manage|updates|none>")
 }
 
 func connectorCommand(root string, args []string, stdout, stderr io.Writer) error {
@@ -575,14 +578,14 @@ Per-user Linux host quick start:
   airlock-host --user service start
   airlock-host --user enroll --airlock https://airlock.example
 
-The interactive enrollment flow asks for full, update_only, or none. Use
+The interactive enrollment flow asks for full, manage, updates, or none. Use
 --mode for noninteractive enrollment.
 
 Usage:
   airlock-host [--user] service <install|start|stop|status|uninstall|enroll>
   airlock-host [--user] enroll --airlock HTTPS-ORIGIN [--mode MODE]
   airlock-host [--user] access get
-  airlock-host [--user] access set full|update_only|none
+  airlock-host [--user] access set full|manage|updates|none
   airlock-host [--user] connector <install|update|rollback|remove|list|status>
   airlock-host version
 
