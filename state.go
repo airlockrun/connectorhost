@@ -182,15 +182,6 @@ func validateResetRoot(root string) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return errors.New("connectorhost: state reset requires a real directory")
 	}
-	if runtime.GOOS != "windows" {
-		resolved, err := filepath.EvalSymlinks(clean)
-		if err != nil {
-			return fmt.Errorf("connectorhost: resolve state directory for reset: %w", err)
-		}
-		if filepath.Clean(resolved) != clean {
-			return errors.New("connectorhost: state reset path cannot traverse symbolic links")
-		}
-	}
 	return secureDirectory(clean)
 }
 

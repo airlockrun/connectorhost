@@ -123,6 +123,32 @@ func TestResetStateRejectsSymlinkRoot(t *testing.T) {
 	}
 }
 
+func TestResetStateAllowsSymlinkedParent(t *testing.T) {
+	parent := t.TempDir()
+	targetParent := filepath.Join(parent, "target")
+	if err := os.Mkdir(targetParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkParent := filepath.Join(parent, "link")
+	if err := os.Symlink(targetParent, linkParent); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	root := filepath.Join(linkParent, "state")
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResetState(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(targetParent, "state", "host.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("host state remains after reset: %v", err)
+	}
+}
+
 func TestResetStateRejectsLockedDirectory(t *testing.T) {
 	root := t.TempDir()
 	store, err := OpenStore(root)
