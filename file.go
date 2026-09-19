@@ -16,13 +16,13 @@ func atomicWrite(path string, body []byte, mode os.FileMode) error {
 	}
 	name := temporary.Name()
 	defer os.Remove(name)
-	if err := temporary.Chmod(mode); err != nil {
-		_ = temporary.Close()
-		return err
-	}
 	// Set permissions before publication; the same-directory rename preserves them.
 	// Reopening the published file to set its Windows ACL can deny concurrent reads.
 	if err := secureFile(temporary.Name()); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Chmod(mode); err != nil {
 		_ = temporary.Close()
 		return err
 	}

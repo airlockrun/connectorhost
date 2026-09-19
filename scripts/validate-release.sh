@@ -97,7 +97,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
       exit 1
     fi
     control_contents="$(dpkg-deb --ctrl-tarfile "$package" | tar -tf -)"
-    for script in postinst prerm; do
+    for script in postinst prerm postrm; do
       if [[ $'\n'"$control_contents"$'\n' != *$'\n./'"$script"$'\n'* ]]; then
         echo "Debian package does not contain $script: $package" >&2
         exit 1

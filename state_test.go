@@ -14,6 +14,311 @@ import (
 	"github.com/airlockrun/agentsdk/connector/protocol"
 )
 
+func TestResetStateDeletesHostIdentityAndConnectorData(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCredentials("https://airlock.example", "credential", "host-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutConnector(inventoryTestRecord(inventoryID)); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(root, "connectors", inventoryID, "state", "data"),
+		filepath.Join(root, "outbox", "event.json"),
+		filepath.Join(root, "management", "job.json"),
+		filepath.Join(root, "logs", "host.log"),
+		filepath.Join(root, ".upload-stale", "part"),
+		filepath.Join(root, "control.json"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("old host data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResetState(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, "host.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("reset caller recreated host.json: %v", err)
+	}
+	store, err = OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	airlockURL, credential := store.Credentials()
+	if airlockURL != "" || credential != "" || store.HostID() != "" {
+		t.Fatalf("enrollment remains: url=%q credential=%q host=%q", airlockURL, credential, store.HostID())
+	}
+	if len(store.Connectors()) != 0 || len(store.PendingInventoryMutations()) != 0 {
+		t.Fatal("connector inventory remains after reset")
+	}
+	if store.AccessMode() != AccessFull {
+		t.Fatalf("access mode = %q, want %q", store.AccessMode(), AccessFull)
+	}
+	for _, name := range []string{"connectors", "outbox", "management", "logs", ".upload-stale", "control.json", resetMarkerName} {
+		if _, err := os.Lstat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("%s remains after reset: %v", name, err)
+		}
+	}
+}
+
+func TestResetStateRejectsUnsafeRoots(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		root func(*testing.T) string
+	}{
+		{name: "missing", root: func(t *testing.T) string { return filepath.Join(t.TempDir(), "missing") }},
+		{name: "unrelated", root: func(t *testing.T) string {
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "important"), []byte("keep"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return root
+		}},
+		{name: "filesystem root", root: func(*testing.T) string { return filepath.VolumeName(t.TempDir()) + string(os.PathSeparator) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			root := test.root(t)
+			if err := ResetState(root); err == nil {
+				t.Fatal("unsafe reset succeeded")
+			}
+			if test.name == "unrelated" {
+				body, err := os.ReadFile(filepath.Join(root, "important"))
+				if err != nil || string(body) != "keep" {
+					t.Fatalf("unrelated data changed: %q, %v", body, err)
+				}
+			}
+		})
+	}
+}
+
+func TestResetStateRejectsSymlinkRoot(t *testing.T) {
+	target := t.TempDir()
+	store, err := OpenStore(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "state-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if err := ResetState(link); err == nil {
+		t.Fatal("symlink reset succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(target, "host.json")); err != nil {
+		t.Fatalf("symlink reset changed target: %v", err)
+	}
+}
+
+func TestResetStateRejectsLockedDirectory(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := ResetState(root); !errors.Is(err, ErrStateLocked) {
+		t.Fatalf("reset error = %v, want ErrStateLocked", err)
+	}
+}
+
+func TestOpenStoreFinishesInterruptedReset(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCredentials("https://airlock.example", "credential", "host-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeResetMarker(root); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(filepath.Join(root, resetMarkerName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o644 {
+			t.Fatalf("reset marker mode = %o, want 644", info.Mode().Perm())
+		}
+	}
+	store, err = OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	airlockURL, credential := store.Credentials()
+	if airlockURL != "" || credential != "" || store.HostID() != "" {
+		t.Fatal("interrupted reset retained enrollment")
+	}
+}
+
+func TestOpenStoreRejectsInvalidResetMarker(t *testing.T) {
+	for _, marker := range []struct {
+		name string
+		make func(string) error
+	}{
+		{name: "content", make: func(path string) error { return os.WriteFile(path, []byte("resetting\n"), 0o600) }},
+		{name: "directory", make: func(path string) error { return os.Mkdir(path, 0o700) }},
+	} {
+		t.Run(marker.name, func(t *testing.T) {
+			root := t.TempDir()
+			store, err := OpenStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := marker.make(filepath.Join(root, resetMarkerName)); err != nil {
+				t.Fatal(err)
+			}
+			if store, err := OpenStore(root); err == nil {
+				store.Close()
+				t.Fatal("invalid reset marker accepted")
+			}
+			if _, err := os.Stat(filepath.Join(root, "host.json")); err != nil {
+				t.Fatalf("invalid marker removed host state: %v", err)
+			}
+		})
+	}
+}
+
+func TestOpenStoreRejectsResetMarkerFromAnotherRoot(t *testing.T) {
+	source := t.TempDir()
+	if err := writeResetMarker(source); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(source, resetMarkerName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	store, err := OpenStore(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(target, resetMarkerName), body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if store, err := OpenStore(target); err == nil {
+		store.Close()
+		t.Fatal("reset marker from another root accepted")
+	}
+	if _, err := os.Stat(filepath.Join(target, "host.json")); err != nil {
+		t.Fatalf("foreign marker removed host state: %v", err)
+	}
+}
+
+func TestResetStateRejectsUnrelatedHostJSON(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "host.json"), []byte(`{"application":"other"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "important"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResetState(root); err == nil {
+		t.Fatal("unrelated host.json accepted")
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "important")); err != nil || string(body) != "keep" {
+		t.Fatalf("unrelated data changed: %q, %v", body, err)
+	}
+}
+
+func TestResetStateRejectsUnexpectedEntry(t *testing.T) {
+	root := t.TempDir()
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCredentials("https://airlock.example", "credential", "host-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "important"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ResetState(root); err == nil {
+		t.Fatal("unexpected state entry accepted")
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "important")); err != nil || string(body) != "keep" {
+		t.Fatalf("unexpected entry changed: %q, %v", body, err)
+	}
+	if body, err := os.ReadFile(filepath.Join(root, "host.json")); err != nil || !strings.Contains(string(body), "credential") {
+		t.Fatalf("host state changed before reset rejection: %q, %v", body, err)
+	}
+}
+
+func TestResetStateDeletionRemainsBoundToOpenedRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("renaming an open directory is not portable on Windows")
+	}
+	parent := t.TempDir()
+	root := filepath.Join(parent, "state")
+	store, err := OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCredentials("https://airlock.example", "credential", "host-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := os.OpenRoot(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bound.Close()
+	if err := writeResetMarkerToRoot(bound, root); err != nil {
+		t.Fatal(err)
+	}
+	moved := filepath.Join(parent, "moved")
+	if err := os.Rename(root, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const replacement = "replacement data"
+	if err := os.WriteFile(filepath.Join(root, "host.json"), []byte(replacement), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := resetStateLocked(bound); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(filepath.Join(root, "host.json"))
+	if err != nil || string(body) != replacement {
+		t.Fatalf("replacement root changed: %q, %v", body, err)
+	}
+	if _, err := os.Stat(filepath.Join(moved, "host.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("opened root host state remains: %v", err)
+	}
+}
+
 func TestStoreContractSingleton(t *testing.T) {
 	for _, method := range []string{"local", "remote", "plain"} {
 		t.Run(method, func(t *testing.T) {

@@ -80,6 +80,16 @@ jobs:
         run: |
           go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_VERSION"
           ./scripts/build-release.sh
+      - name: Build and inspect container image
+        run: |
+          version="$(go run ./cmd/airlock-host version)"
+          version="${version#airlock-host }"
+          docker build \
+            --build-arg "VERSION=$version" \
+            --build-arg "REVISION=$GITHUB_SHA" \
+            --tag connectorhost:test .
+          [[ "$(docker run --rm connectorhost:test version)" == "airlock-host $version" ]]
+          [[ "$(docker inspect connectorhost:test --format '{{.Config.User}}')" == "65532:65532" ]]
       - name: Native Debian package lifecycle
         run: |
           cleanup() {
@@ -132,6 +142,10 @@ jobs:
           sudo dpkg --remove airlock-host
           [[ ! -e /etc/systemd/system/airlock-host.service ]]
           [[ -d /var/lib/airlock-host ]]
+          sudo touch /var/lib/airlock-host/purge-marker
+          sudo dpkg --purge airlock-host
+          [[ ! -e /var/lib/airlock-host ]]
+          [[ ! -e /usr/local/bin/airlock-host ]]
       - name: Offline RPM package lifecycle
         run: |
           packages=(dist/*-linux-amd64.rpm)

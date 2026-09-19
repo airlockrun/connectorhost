@@ -93,6 +93,9 @@ func runWithServiceManager(args []string, stdin io.Reader, stdout, stderr io.Wri
 	if args[0] == "enroll" {
 		return enrollCommand(scope, managerFactory, *stateDirectory, args[1:], stdin, stdout, stderr)
 	}
+	if args[0] == "unenroll" {
+		return unenrollCommand(scope, managerFactory, *stateDirectory, args[1:], stdout, stderr)
+	}
 	if *userService && args[0] == "serve" {
 		return errors.New("airlock-host: --user selects a managed service and cannot be used with serve")
 	}
@@ -154,6 +157,41 @@ func enrollCommand(scope nativeServiceScope, managerFactory nativeServiceManager
 		return err
 	}
 	return enrollManagedService(ctx, scope, manager, airlockURL, mode, stdout)
+}
+
+func unenrollCommand(scope nativeServiceScope, managerFactory nativeServiceManagerFactory, stateDirectory string, args []string, stdout, stderr io.Writer) error {
+	set := flag.NewFlagSet("unenroll", flag.ContinueOnError)
+	set.SetOutput(stderr)
+	deleteConnectors := set.Bool("delete-connectors", false, "permanently delete all local connector installations and host state")
+	if err := set.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	if set.NArg() != 0 || !*deleteConnectors {
+		return errors.New("airlock-host: unenroll requires --delete-connectors")
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if stateDirectory != "" {
+		if err := connectorhost.ResetState(stateDirectory); err != nil {
+			if errors.Is(err, connectorhost.ErrStateLocked) {
+				return errors.New("airlock-host: state directory is in use; stop its serve process before unenrolling")
+			}
+			return err
+		}
+	} else {
+		manager, err := managerFactory(scope)
+		if err != nil {
+			return err
+		}
+		if err := unenrollManagedService(ctx, manager); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintln(stdout, "unenrolled; deleted local connectors and host state")
+	return err
 }
 
 func parseEnrollmentOptions(command string, args []string, stdin io.Reader, stdout, stderr io.Writer) (string, connectorhost.AccessMode, error) {
@@ -583,14 +621,16 @@ The interactive enrollment flow asks for full, manage, updates, or none. Use
 
 Usage:
   airlock-host [--user] service <install|start|stop|status|uninstall|enroll>
-  airlock-host [--user] enroll --airlock HTTPS-ORIGIN [--mode MODE]
+	  airlock-host [--user] enroll --airlock HTTPS-ORIGIN [--mode MODE]
+	  airlock-host [--user] unenroll --delete-connectors
   airlock-host [--user] access get
   airlock-host [--user] access set full|manage|updates|none
   airlock-host [--user] connector <install|update|rollback|remove|list|status>
   airlock-host version
 
 Standalone mode:
-  airlock-host --state-dir DIR enroll --airlock HTTPS-ORIGIN [--mode MODE]
+	  airlock-host --state-dir DIR enroll --airlock HTTPS-ORIGIN [--mode MODE]
+	  airlock-host --state-dir DIR unenroll --delete-connectors
   airlock-host --state-dir DIR serve [--control-port PORT]
 
 Options:

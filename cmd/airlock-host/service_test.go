@@ -15,12 +15,16 @@ type testNativeServiceManager struct {
 	stateDirectory string
 	status         nativeServiceStatus
 	startCalls     int
+	stopCalls      int
 }
 
 func (*testNativeServiceManager) Install(context.Context) error   { return nil }
-func (*testNativeServiceManager) Stop(context.Context) error      { return nil }
 func (*testNativeServiceManager) Uninstall(context.Context) error { return nil }
-func (m *testNativeServiceManager) StateDirectory() string        { return m.stateDirectory }
+func (m *testNativeServiceManager) Stop(context.Context) error {
+	m.stopCalls++
+	return nil
+}
+func (m *testNativeServiceManager) StateDirectory() string { return m.stateDirectory }
 func (m *testNativeServiceManager) Status(context.Context) (nativeServiceStatus, error) {
 	return m.status, nil
 }
@@ -73,5 +77,66 @@ func TestUserServiceInstallReportsScopedNextSteps(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "airlock-host --user service start") || !strings.Contains(output.String(), "airlock-host --user enroll") {
 		t.Fatalf("install output = %q", output.String())
+	}
+}
+
+func TestManagedUnenrollStopsResetsAndRestartsRunningService(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store, err := connectorhost.OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCredentials("https://airlock.example", "credential", "host-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manager := &testNativeServiceManager{stateDirectory: root, status: nativeServiceStatus{State: serviceRunning}}
+	if err := unenrollManagedService(t.Context(), manager); err != nil {
+		t.Fatal(err)
+	}
+	if manager.stopCalls != 1 || manager.startCalls != 1 {
+		t.Fatalf("stop calls = %d, start calls = %d", manager.stopCalls, manager.startCalls)
+	}
+	store, err = connectorhost.OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	airlockURL, credential := store.Credentials()
+	if airlockURL != "" || credential != "" || store.HostID() != "" {
+		t.Fatal("managed unenroll retained enrollment")
+	}
+}
+
+func TestManagedUnenrollLeavesStoppedServiceStopped(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "state")
+	store, err := connectorhost.OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	manager := &testNativeServiceManager{stateDirectory: root, status: nativeServiceStatus{State: serviceStopped}}
+	if err := unenrollManagedService(t.Context(), manager); err != nil {
+		t.Fatal(err)
+	}
+	if manager.stopCalls != 0 || manager.startCalls != 0 {
+		t.Fatalf("stop calls = %d, start calls = %d", manager.stopCalls, manager.startCalls)
+	}
+}
+
+func TestManagedUnenrollRestartsPreviouslyRunningServiceAfterResetFailure(t *testing.T) {
+	manager := &testNativeServiceManager{
+		stateDirectory: t.TempDir(),
+		status:         nativeServiceStatus{State: serviceRunning},
+	}
+	if err := unenrollManagedService(t.Context(), manager); err == nil {
+		t.Fatal("invalid state reset returned success")
+	}
+	if manager.stopCalls != 1 || manager.startCalls != 1 {
+		t.Fatalf("stop calls = %d, start calls = %d", manager.stopCalls, manager.startCalls)
 	}
 }

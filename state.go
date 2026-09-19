@@ -1,12 +1,15 @@
 package connectorhost
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -18,6 +21,16 @@ import (
 )
 
 const stateVersion = 3
+
+const resetMarkerName = ".resetting"
+
+const resetMarkerMagic = "airlock-host-state-reset-v1"
+
+type resetMarker struct {
+	Magic string `json:"magic"`
+	Root  string `json:"root"`
+	Nonce string `json:"nonce"`
+}
 
 var ErrStateLocked = errors.New("connectorhost: state directory is locked")
 
@@ -59,21 +72,31 @@ type Store struct {
 }
 
 func OpenStore(root string) (*Store, error) {
-	if !filepath.IsAbs(root) {
-		return nil, errors.New("connectorhost: state directory must be absolute")
-	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
+	if err := prepareStateRoot(root); err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		return nil, err
-	}
-	if err := secureDirectory(root); err != nil {
-		return nil, err
+	stateRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("connectorhost: open state directory: %w", err)
 	}
 	lock, err := acquireProcessLock(filepath.Join(root, ".lock"))
 	if err != nil {
+		_ = stateRoot.Close()
 		return nil, fmt.Errorf("connectorhost: lock state directory: %w", err)
+	}
+	defer stateRoot.Close()
+	if err := requireRootAtPath(stateRoot, root); err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	if marked, err := hasValidResetMarker(stateRoot, root); err != nil {
+		_ = lock.Close()
+		return nil, err
+	} else if marked {
+		if err := resetStateLocked(stateRoot); err != nil {
+			_ = lock.Close()
+			return nil, fmt.Errorf("connectorhost: finish interrupted state reset: %w", err)
+		}
 	}
 	store := &Store{root: root, lock: lock}
 	if err := store.load(); err != nil {
@@ -81,6 +104,271 @@ func OpenStore(root string) (*Store, error) {
 		return nil, err
 	}
 	return store, nil
+}
+
+// ResetState permanently removes enrollment, connectors, artifacts, child
+// state, and queued outcomes from one stopped host state directory.
+func ResetState(root string) error {
+	if err := validateResetRoot(root); err != nil {
+		return err
+	}
+	stateRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return fmt.Errorf("connectorhost: open state directory for reset: %w", err)
+	}
+	defer stateRoot.Close()
+	lock, err := acquireProcessLock(filepath.Join(root, ".lock"))
+	if err != nil {
+		return fmt.Errorf("connectorhost: lock state directory for reset: %w", err)
+	}
+	defer lock.Close()
+	if err := requireRootAtPath(stateRoot, root); err != nil {
+		return err
+	}
+	if err := validateResetRoot(root); err != nil {
+		return err
+	}
+	if err := requireRootAtPath(stateRoot, root); err != nil {
+		return err
+	}
+	if err := validateResetContents(stateRoot, root); err != nil {
+		return err
+	}
+	if _, err := resetStateEntries(stateRoot); err != nil {
+		return err
+	}
+	if err := writeResetMarkerToRoot(stateRoot, root); err != nil {
+		return fmt.Errorf("connectorhost: mark state reset: %w", err)
+	}
+	if err := resetStateLocked(stateRoot); err != nil {
+		return fmt.Errorf("connectorhost: reset state: %w", err)
+	}
+	return nil
+}
+
+func prepareStateRoot(root string) error {
+	if !filepath.IsAbs(root) {
+		return errors.New("connectorhost: state directory must be absolute")
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("connectorhost: state path must be a real directory")
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		return err
+	}
+	return secureDirectory(root)
+}
+
+func validateResetRoot(root string) error {
+	if !filepath.IsAbs(root) {
+		return errors.New("connectorhost: state directory must be absolute")
+	}
+	clean := filepath.Clean(root)
+	volumeRoot := filepath.VolumeName(clean) + string(os.PathSeparator)
+	if clean == filepath.Clean(volumeRoot) {
+		return errors.New("connectorhost: refusing to reset a filesystem root")
+	}
+	info, err := os.Lstat(clean)
+	if err != nil {
+		return fmt.Errorf("connectorhost: inspect state directory for reset: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("connectorhost: state reset requires a real directory")
+	}
+	if runtime.GOOS != "windows" {
+		resolved, err := filepath.EvalSymlinks(clean)
+		if err != nil {
+			return fmt.Errorf("connectorhost: resolve state directory for reset: %w", err)
+		}
+		if filepath.Clean(resolved) != clean {
+			return errors.New("connectorhost: state reset path cannot traverse symbolic links")
+		}
+	}
+	return secureDirectory(clean)
+}
+
+func validateResetContents(root *os.Root, path string) error {
+	if marked, err := hasValidResetMarker(root, path); err != nil {
+		return err
+	} else if marked {
+		return nil
+	}
+	info, err := root.Lstat("host.json")
+	if err != nil {
+		return fmt.Errorf("connectorhost: state reset requires an existing host.json: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New("connectorhost: state reset requires a regular host.json")
+	}
+	body, err := root.ReadFile("host.json")
+	if err != nil {
+		return err
+	}
+	var state persistedState
+	if err := strictJSON(body, &state); err != nil {
+		return fmt.Errorf("connectorhost: state reset requires valid host state: %w", err)
+	}
+	if state.Version < 1 || state.Version > stateVersion || state.Connectors == nil {
+		return errors.New("connectorhost: state reset requires recognized host state")
+	}
+	return nil
+}
+
+func hasValidResetMarker(root *os.Root, path string) (bool, error) {
+	info, err := root.Lstat(resetMarkerName)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, errors.New("connectorhost: invalid state reset marker")
+	}
+	body, err := root.ReadFile(resetMarkerName)
+	if err != nil {
+		return false, err
+	}
+	var marker resetMarker
+	if err := strictJSON(body, &marker); err != nil {
+		return false, errors.New("connectorhost: invalid state reset marker")
+	}
+	if marker.Magic != resetMarkerMagic || marker.Root != filepath.Clean(path) || len(marker.Nonce) != 32 {
+		return false, errors.New("connectorhost: invalid state reset marker")
+	}
+	if _, err := hex.DecodeString(marker.Nonce); err != nil {
+		return false, errors.New("connectorhost: invalid state reset marker")
+	}
+	return true, nil
+}
+
+func writeResetMarker(root string) error {
+	stateRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return err
+	}
+	defer stateRoot.Close()
+	return writeResetMarkerToRoot(stateRoot, root)
+}
+
+func writeResetMarkerToRoot(root *os.Root, path string) error {
+	nonce := make([]byte, 16)
+	if _, err := rand.Read(nonce); err != nil {
+		return err
+	}
+	nonceText := hex.EncodeToString(nonce)
+	body, err := json.Marshal(resetMarker{Magic: resetMarkerMagic, Root: filepath.Clean(path), Nonce: nonceText})
+	if err != nil {
+		return err
+	}
+	body = append(body, '\n')
+	temporaryName := ".write-reset-" + nonceText
+	temporary, err := root.OpenFile(temporaryName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	defer root.Remove(temporaryName)
+	if _, err := temporary.Write(body); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := root.Rename(temporaryName, resetMarkerName); err != nil {
+		return err
+	}
+	return syncStateRoot(root)
+}
+
+func resetStateLocked(root *os.Root) error {
+	entries, err := resetStateEntries(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == ".lock" || entry.Name() == resetMarkerName {
+			continue
+		}
+		if err := root.RemoveAll(entry.Name()); err != nil {
+			return err
+		}
+	}
+	if err := syncStateRoot(root); err != nil {
+		return err
+	}
+	if err := root.Remove(resetMarkerName); err != nil {
+		return err
+	}
+	return syncStateRoot(root)
+}
+
+func resetStateEntries(root *os.Root) ([]os.DirEntry, error) {
+	directory, err := root.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	defer directory.Close()
+	entries, err := directory.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.Name() == ".lock" || entry.Name() == resetMarkerName {
+			continue
+		}
+		if !resettableStateEntry(entry.Name()) {
+			return nil, fmt.Errorf("connectorhost: state reset found unexpected entry %q", entry.Name())
+		}
+	}
+	return entries, nil
+}
+
+func requireRootAtPath(root *os.Root, path string) error {
+	bound, err := root.Lstat(".")
+	if err != nil {
+		return err
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("connectorhost: inspect state directory identity: %w", err)
+	}
+	if !os.SameFile(bound, current) {
+		return errors.New("connectorhost: state directory changed while being opened")
+	}
+	return nil
+}
+
+func syncStateRoot(root *os.Root) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
+}
+
+func resettableStateEntry(name string) bool {
+	switch name {
+	case "host.json", "connectors", "outbox", "management", "logs", "control.json":
+		return true
+	default:
+		return strings.HasPrefix(name, ".upload-") || strings.HasPrefix(name, ".write-")
+	}
 }
 
 func (s *Store) load() error {

@@ -20,6 +20,7 @@ trusted Airlock builds and protect the host account as one trust domain.
 
 ```text
 airlock-host [--user] enroll --airlock https://airlock.example [--mode full|manage|updates|none]
+airlock-host [--user] unenroll --delete-connectors
 airlock-host [--user | --state-dir DIR] access get
 airlock-host [--user | --state-dir DIR] access set full|manage|updates|none
 airlock-host [--user | --state-dir DIR] connector list
@@ -31,6 +32,7 @@ airlock-host [--user | --state-dir DIR] connector remove ID
 airlock-host [--user] service install|start|stop|status|uninstall
 airlock-host [--user] service enroll --airlock https://airlock.example [--mode full|manage|updates|none]
 airlock-host --state-dir DIR enroll --airlock https://airlock.example [--mode full|manage|updates|none]
+airlock-host --state-dir DIR unenroll --delete-connectors
 airlock-host --state-dir DIR serve [--control-port PORT]
 ```
 
@@ -211,9 +213,34 @@ the machine service. Refresh a user service's private executable by rerunning
 `service uninstall` removes the systemd or Windows SCM registration but
 intentionally preserves the managed binary and credential-bearing state. The
 same applies to a Linux user service; uninstalling it does not change lingering.
-Delete `/var/lib/airlock-host`, `~/.config/airlock/host`, or
-`%ProgramData%\Airlock\Host` separately only when that host identity is being
-permanently decommissioned.
+Use `airlock-host unenroll --delete-connectors` to permanently remove the local
+host identity, connector installations, artifacts, child state, and queued
+outcomes. The command stops and safely restarts a running managed service;
+standalone `--state-dir` hosts must be stopped first. Ordinary package removal
+and RPM erase preserve state, while Debian package purge permanently removes it.
+
+## Container image
+
+Release tags publish a Linux amd64, arm64, and ARMv7 image at
+`ghcr.io/airlockrun/connectorhost:<version>`. The image runs as UID/GID 65532,
+uses `/var/lib/airlock-host` as its state volume, and starts a standalone host.
+Enroll a new persistent volume before starting the long-running container:
+
+```sh
+docker volume create airlock-host-state
+docker run --rm -it \
+  --mount source=airlock-host-state,target=/var/lib/airlock-host \
+  ghcr.io/airlockrun/connectorhost:v0.1.0-rc.7 \
+  enroll --airlock https://airlock.example --mode none
+docker run -d --name airlock-host --restart unless-stopped \
+  --mount source=airlock-host-state,target=/var/lib/airlock-host \
+  ghcr.io/airlockrun/connectorhost:v0.1.0-rc.7
+```
+
+The image contains a POSIX shell for authorized `full`-mode shell work. Bind
+mounts must grant UID/GID 65532 read, write, and execute access. Stop the
+container before using a one-shot `unenroll --delete-connectors` container with
+the same volume. Container removal preserves the volume.
 
 Windows ZIP archives contain `install-airlock-host.ps1`. Run it from an
 elevated PowerShell session after verifying `SHA256SUMS`; it delegates native
@@ -241,8 +268,9 @@ installer custom action would provide misleading trust and failure semantics.
 CI runs the full test suite natively on Linux, macOS, and Windows, runs the Go
 race detector on Linux, and uploads cross-compiled archives for Linux amd64,
 arm64, and ARMv7 plus macOS and Windows amd64/arm64. It also builds `.deb` and
-`.rpm` packages for every Linux architecture and validates package metadata,
-archive contents, and checksums.
+`.rpm` packages for every Linux architecture, validates package metadata,
+archive contents, and checksums, and publishes the multi-architecture container
+image.
 
 The `release` GitHub workflow validates the version in `version.go`, refuses to
 reuse an existing tag, creates an annotated tag, and publishes those archives

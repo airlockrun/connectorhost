@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 concurrency:
   group: connectorhost-publish-${{ inputs.version }}
@@ -39,6 +40,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Verify release revision
+        id: revision
         env:
           EXPECTED_COMMIT: ${{ inputs.commit }}
           GH_TOKEN: ${{ github.token }}
@@ -70,6 +72,7 @@ jobs:
             echo "::error::remote tag commit $remote_commit does not match checkout $tag_commit"
             exit 1
           fi
+          echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: go.mod
@@ -80,6 +83,48 @@ jobs:
         run: |
           go install "github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_VERSION"
           ./scripts/build-release.sh
+      - name: Verify publication is still allowed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+          VERIFIED_COMMIT: ${{ steps.revision.outputs.commit }}
+        run: |
+          read -r object_type object_sha < <(
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_VERSION" \
+              --jq '.object | [.type, .sha] | @tsv'
+          )
+          if [[ "$object_type" == "tag" ]]; then
+            remote_commit="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq .object.sha)"
+          else
+            remote_commit="$object_sha"
+          fi
+          if [[ "$remote_commit" != "$VERIFIED_COMMIT" ]]; then
+            echo "::error::release tag changed during the build"
+            exit 1
+          fi
+          if gh release view "$RELEASE_VERSION" >/dev/null 2>&1; then
+            is_draft="$(gh release view "$RELEASE_VERSION" --json isDraft --jq .isDraft)"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "::error::refusing to replace published release $RELEASE_VERSION"
+              exit 1
+            fi
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish container image
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ghcr.io/airlockrun/connectorhost:${{ inputs.version }}
+          build-args: |
+            VERSION=${{ inputs.version }}
+            REVISION=${{ steps.revision.outputs.commit }}
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

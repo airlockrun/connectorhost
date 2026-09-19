@@ -163,6 +163,30 @@ func enrollManagedService(ctx context.Context, scope nativeServiceScope, manager
 	return enrollHost(ctx, manager.StateDirectory(), airlockURL, mode, stdout)
 }
 
+func unenrollManagedService(ctx context.Context, manager nativeServiceManager) error {
+	status, err := manager.Status(ctx)
+	if err != nil {
+		return err
+	}
+	restart := status.State == serviceRunning || status.State == serviceStartPending
+	switch status.State {
+	case serviceRunning, serviceStartPending, serviceStopPending, servicePaused:
+		if err := manager.Stop(ctx); err != nil {
+			return err
+		}
+	case serviceStopped, serviceNotInstalled:
+	case serviceUnknown:
+		return errors.New("airlock-host: cannot unenroll while managed service state is unknown")
+	default:
+		return fmt.Errorf("airlock-host: cannot unenroll from managed service state %q", status.State)
+	}
+	resetErr := connectorhost.ResetState(manager.StateDirectory())
+	if restart {
+		return errors.Join(resetErr, manager.Start(ctx))
+	}
+	return resetErr
+}
+
 func requireUnenrolledState(stateDirectory string) error {
 	store, err := connectorhost.OpenStore(stateDirectory)
 	if err != nil {

@@ -90,6 +90,52 @@ func TestAccessCommandFallsBackToDirectStore(t *testing.T) {
 	}
 }
 
+func TestStandaloneUnenrollRequiresConfirmationAndDeletesState(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "instance")
+	store, err := connectorhost.OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCredentials("https://airlock.example", "credential", "host-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"--state-dir", root, "unenroll"}, bytes.NewReader(nil), io.Discard, io.Discard); err == nil || !strings.Contains(err.Error(), "--delete-connectors") {
+		t.Fatalf("missing confirmation error = %v", err)
+	}
+	var output bytes.Buffer
+	if err := run([]string{"--state-dir", root, "unenroll", "--delete-connectors"}, bytes.NewReader(nil), &output, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "unenrolled") {
+		t.Fatalf("output = %q", output.String())
+	}
+	store, err = connectorhost.OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	airlockURL, credential := store.Credentials()
+	if airlockURL != "" || credential != "" || store.HostID() != "" {
+		t.Fatal("unenroll retained enrollment")
+	}
+}
+
+func TestStandaloneUnenrollRejectsRunningHost(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "instance")
+	store, err := connectorhost.OpenStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	err = run([]string{"--state-dir", root, "unenroll", "--delete-connectors"}, bytes.NewReader(nil), io.Discard, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "stop its serve process") {
+		t.Fatalf("unenroll error = %v", err)
+	}
+}
+
 func TestMutatingControlLostResponseIsNotReplayed(t *testing.T) {
 	tests := []struct {
 		name   string
