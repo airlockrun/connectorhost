@@ -140,6 +140,11 @@ func (h *Host) serveRemote(ctx context.Context) error {
 func (h *Host) runSession(hostCtx, sessionCtx context.Context, client *ControlClient) error {
 	ctx, cancel := context.WithCancel(sessionCtx)
 	defer cancel()
+	mutationCtx, stop := context.WithTimeout(ctx, 10*time.Second)
+	if err := h.flushInventoryMutations(mutationCtx, client); err != nil {
+		h.logger.Warn("connector inventory delivery pending", "error", err)
+	}
+	stop()
 	syncCtx, stop := context.WithTimeout(ctx, 15*time.Second)
 	response, err := client.Sync(syncCtx, h.syncRequest())
 	stop()
@@ -219,7 +224,9 @@ func (h *Host) runSession(hostCtx, sessionCtx context.Context, client *ControlCl
 			h.recoverManagementOutcomes(ctx)
 			h.flushManagementOutcomes(ctx)
 			mutationCtx, stop := context.WithTimeout(ctx, 10*time.Second)
-			h.flushInventoryMutations(mutationCtx, client)
+			if err := h.flushInventoryMutations(mutationCtx, client); err != nil {
+				h.logger.Warn("connector inventory delivery pending", "error", err)
+			}
 			stop()
 			h.retryConnectorStartup(hostCtx)
 			if sleepContext(ctx, 20*time.Second) != nil {
@@ -324,13 +331,14 @@ func (h *Host) syncRequest() protocol.HostSyncRequest {
 	return protocol.HostSyncRequest{Host: protocol.HostInfo{ProtocolVersion: protocol.HostProtocolVersion, Name: name, Platform: runtime.GOOS, Architecture: platformArchitecture(), AccessMode: h.store.AccessMode(), Version: Version}, Connectors: connectors}
 }
 
-func (h *Host) flushInventoryMutations(ctx context.Context, client *ControlClient) {
+func (h *Host) flushInventoryMutations(ctx context.Context, client *ControlClient) error {
 	mutations := h.store.PendingInventoryMutations()
 	if len(mutations) == 0 {
-		return
+		return nil
 	}
 	const workers = 8
 	work := make(chan protocol.HostConnectorInventoryMutationRequest)
+	failures := make(chan error, len(mutations))
 	var wait sync.WaitGroup
 	for range min(workers, len(mutations)) {
 		wait.Add(1)
@@ -339,12 +347,17 @@ func (h *Host) flushInventoryMutations(ctx context.Context, client *ControlClien
 			for mutation := range work {
 				if mutation.ManagementAttempt != nil {
 					_, found, err := h.store.loadManagementOutcome(mutation.ManagementAttempt.JobID)
-					if err != nil || found {
+					if err != nil {
+						failures <- fmt.Errorf("load inventory mutation %s revision %d management outcome: %w", mutation.InstallationID, mutation.Revision, err)
+						continue
+					}
+					if found {
 						continue
 					}
 				}
 				response, err := client.InventoryMutation(ctx, mutation)
 				if err != nil {
+					failures <- fmt.Errorf("deliver inventory mutation %s revision %d: %w", mutation.InstallationID, mutation.Revision, err)
 					continue
 				}
 				if !h.managementMu.TryLock() {
@@ -352,10 +365,18 @@ func (h *Host) flushInventoryMutations(ctx context.Context, client *ControlClien
 				}
 				before, existed := h.store.Connector(mutation.InstallationID)
 				record, applied, err := h.store.AcknowledgeInventoryMutation(mutation, response)
-				if err == nil && applied && mutation.Kind == protocol.HostConnectorMutationUpsert && (!existed || !slices.Equal(before.StorageOrigins, record.StorageOrigins)) {
+				if err != nil {
+					failures <- fmt.Errorf("persist inventory acknowledgement %s revision %d: %w", mutation.InstallationID, mutation.Revision, err)
+					h.managementMu.Unlock()
+					continue
+				}
+				if applied && mutation.Kind == protocol.HostConnectorMutationUpsert && (!existed || !slices.Equal(before.StorageOrigins, record.StorageOrigins)) {
 					restartCtx, restartCancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
-					_ = h.supervisor.Start(restartCtx, record.InstallationID)
+					err = h.supervisor.Start(restartCtx, record.InstallationID)
 					restartCancel()
+					if err != nil {
+						failures <- fmt.Errorf("restart connector %s after inventory acknowledgement: %w", mutation.InstallationID, err)
+					}
 				}
 				h.managementMu.Unlock()
 			}
@@ -367,11 +388,22 @@ func (h *Host) flushInventoryMutations(ctx context.Context, client *ControlClien
 		case <-ctx.Done():
 			close(work)
 			wait.Wait()
-			return
+			close(failures)
+			var result error
+			for err := range failures {
+				result = errors.Join(result, err)
+			}
+			return errors.Join(result, ctx.Err())
 		}
 	}
 	close(work)
 	wait.Wait()
+	close(failures)
+	var result error
+	for err := range failures {
+		result = errors.Join(result, err)
+	}
+	return result
 }
 
 func (h *Host) activeAttempts() ([]protocol.ActiveAttempt, error) {
@@ -462,7 +494,7 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 		if completion.Status == "success" {
 			h.logger.Info("management work completed", "kind", kind, "job_id", job.JobID, "connector_id", connectorID, "status", completion.Status)
 		} else {
-			h.logger.Warn("management work completed", "kind", kind, "job_id", job.JobID, "connector_id", connectorID, "status", completion.Status)
+			h.logger.Warn("management work completed", "kind", kind, "job_id", job.JobID, "connector_id", connectorID, "status", completion.Status, "error", completion.Error)
 		}
 		if !sendCompletion {
 			return

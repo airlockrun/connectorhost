@@ -272,6 +272,17 @@ func validateExpectedDigest(digest string, optional bool) error {
 }
 
 func validateManifestTarget(manifest protocol.Manifest) error {
+	const hostedChildV1 = "hosted-child-v1"
+	supportsHostedChild := false
+	for _, feature := range manifest.Features {
+		if feature == hostedChildV1 {
+			supportsHostedChild = true
+			break
+		}
+	}
+	if !supportsHostedChild {
+		return fmt.Errorf("connectorhost: candidate does not support %s", hostedChildV1)
+	}
 	hostTarget := runtime.GOOS + "-" + platformArchitecture()
 	for _, target := range manifest.Targets {
 		if target == hostTarget {

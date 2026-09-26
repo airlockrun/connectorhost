@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -91,6 +92,21 @@ func TestControlClientMultiplexesOneAuthenticatedSession(t *testing.T) {
 func TestControlClientRejectsNonHTTPSOrigin(t *testing.T) {
 	if _, err := NewControlClient("http://airlock.example", "credential", nil); err == nil {
 		t.Fatal("HTTP accepted")
+	}
+}
+
+func TestControlClientReportsWebSocketUpgradeResponse(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	}))
+	defer server.Close()
+	client, err := NewControlClient(server.URL, "credential", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = client.Connect(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "502 Bad Gateway") || !strings.Contains(err.Error(), "upstream unavailable") {
+		t.Fatalf("Connect error = %v", err)
 	}
 }
 

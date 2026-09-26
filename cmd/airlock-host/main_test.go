@@ -74,6 +74,22 @@ func TestManagedCommandsUseManagedServiceState(t *testing.T) {
 	}
 }
 
+func TestConnectorStatusIncludesReadinessError(t *testing.T) {
+	var output bytes.Buffer
+	err := writeConnectorStatuses(&output, []connectorhost.LocalConnectorStatus{{
+		InstallationID: "connector-1",
+		DisplayName:    "Zigbee",
+		Readiness:      "unhealthy",
+		Error:          "connect to Mosquitto: not Authorized",
+	}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "connect to Mosquitto: not Authorized") {
+		t.Fatalf("status output = %q", output.String())
+	}
+}
+
 func TestAccessCommandFallsBackToDirectStore(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "instance")
 	var stdout, stderr bytes.Buffer

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -65,8 +66,19 @@ func (c *ControlClient) Connect(ctx context.Context) error {
 	}
 	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	conn, _, err := websocket.Dial(dialCtx, c.baseURL+"/api/hosts/v1/connect", &websocket.DialOptions{HTTPClient: c.http, HTTPHeader: http.Header{"Authorization": {"Bearer " + c.credential}}, Subprotocols: []string{protocol.HostTransportProtocol}})
+	conn, response, err := websocket.Dial(dialCtx, c.baseURL+"/api/hosts/v1/connect", &websocket.DialOptions{HTTPClient: c.http, HTTPHeader: http.Header{"Authorization": {"Bearer " + c.credential}}, Subprotocols: []string{protocol.HostTransportProtocol}})
 	if err != nil {
+		if response != nil {
+			defer response.Body.Close()
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, 4096))
+			if readErr == nil {
+				detail := strings.TrimSpace(string(body))
+				if detail != "" {
+					return fmt.Errorf("connectorhost: WebSocket upgrade failed with %s: %s: %w", response.Status, detail, err)
+				}
+			}
+			return fmt.Errorf("connectorhost: WebSocket upgrade failed with %s: %w", response.Status, err)
+		}
 		return err
 	}
 	if conn.Subprotocol() != protocol.HostTransportProtocol {

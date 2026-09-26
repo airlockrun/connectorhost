@@ -129,12 +129,16 @@ func TestInventoryMutationLostResponseRetriesAndDoesNotBlockOthers(t *testing.T)
 	})
 	client := connectTestClient(t, server)
 	host := newTestHost(store, server.Client())
-	host.flushInventoryMutations(t.Context(), client)
+	if err := host.flushInventoryMutations(t.Context(), client); err == nil {
+		t.Fatal("lost response did not report a pending delivery")
+	}
 	pending := store.PendingInventoryMutations()
 	if len(pending) != 1 || pending[0].InstallationID != inventoryID {
 		t.Fatalf("pending after partial failure = %+v", pending)
 	}
-	host.flushInventoryMutations(t.Context(), client)
+	if err := host.flushInventoryMutations(t.Context(), client); err != nil {
+		t.Fatal(err)
+	}
 	if pending := store.PendingInventoryMutations(); len(pending) != 0 {
 		t.Fatalf("pending after retry = %+v", pending)
 	}
@@ -143,6 +147,57 @@ func TestInventoryMutationLostResponseRetriesAndDoesNotBlockOthers(t *testing.T)
 	mu.Unlock()
 	if len(replayed) != 2 || !inventoryMutationsEqual(replayed[0], replayed[1]) {
 		t.Fatalf("lost-response replay = %+v", replayed)
+	}
+}
+
+func TestSessionReplaysInventoryBeforeInitialSync(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "instance"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.PutLocalConnector(inventoryTestRecord(inventoryID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetCredentials("https://airlock.example", "credential", "host"); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var requests []string
+	syncedConnectors := -1
+	ctx, cancel := context.WithCancel(t.Context())
+	server := controlTestServer(t, func(message protocol.HostMessage) protocol.HostMessage {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case message.Inventory != nil:
+			requests = append(requests, "inventory")
+			return protocol.HostMessage{Inventoried: &protocol.HostConnectorInventoryMutationResponse{InstallationID: message.Inventory.InstallationID, AcknowledgedRevision: message.Inventory.Revision}}
+		case message.Sync != nil:
+			requests = append(requests, "sync")
+			syncedConnectors = len(message.Sync.Connectors)
+			cancel()
+			return protocol.HostMessage{Synced: &protocol.HostSyncResponse{HostID: "host", HeartbeatSeconds: 20}}
+		default:
+			return protocol.HostMessage{Ack: &struct{}{}}
+		}
+	})
+	client := connectTestClient(t, server)
+	host := newTestHost(store, server.Client())
+	if err := host.runSession(t.Context(), ctx, client); !errors.Is(err, context.Canceled) {
+		t.Fatalf("runSession error = %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !slices.Equal(requests, []string{"inventory", "sync"}) {
+		t.Fatalf("request order = %v", requests)
+	}
+	if syncedConnectors != 1 {
+		t.Fatalf("initial sync connector count = %d", syncedConnectors)
+	}
+	if pending := store.PendingInventoryMutations(); len(pending) != 0 {
+		t.Fatalf("inventory remains pending after reconnect: %+v", pending)
 	}
 }
 
@@ -254,7 +309,13 @@ func TestInventoryAcknowledgementRestartsWithPersistedStorageOrigins(t *testing.
 				return protocol.HostMessage{Inventoried: &protocol.HostConnectorInventoryMutationResponse{InstallationID: mutation.InstallationID, AcknowledgedRevision: mutation.Revision, StorageOrigins: origins}}
 			})
 			client := connectTestClient(t, server)
-			host.flushInventoryMutations(ctx, client)
+			err = host.flushInventoryMutations(ctx, client)
+			if test.rejected && err == nil {
+				t.Fatal("rejected connector restart did not report an error")
+			}
+			if !test.rejected && err != nil {
+				t.Fatal(err)
+			}
 			waitForDifferentTestPID(t, pidPath, initialPID)
 			persisted, exists := store.Connector(inventoryID)
 			if !exists || !persisted.InventoryAcknowledged || !slices.Equal(persisted.StorageOrigins, origins) || len(host.syncRequest().Connectors) != 1 {
@@ -435,7 +496,9 @@ func TestRemoteTransitionsReplayCompletionBeforeInventory(t *testing.T) {
 			if len(host.syncRequest().Connectors) != 0 {
 				t.Fatal("unacknowledged remote artifact entered compact sync")
 			}
-			host.flushInventoryMutations(t.Context(), host.client)
+			if err := host.flushInventoryMutations(t.Context(), host.client); err != nil {
+				t.Fatal(err)
+			}
 			mu.Lock()
 			early := len(mutations)
 			mu.Unlock()
@@ -473,7 +536,9 @@ func TestRemoteTransitionsReplayCompletionBeforeInventory(t *testing.T) {
 			}
 			allowCompletion.Store(true)
 			host.flushManagementOutcomes(t.Context())
-			host.flushInventoryMutations(t.Context(), host.client)
+			if err := host.flushInventoryMutations(t.Context(), host.client); err == nil {
+				t.Fatal("lost inventory acknowledgement did not report a pending delivery")
+			}
 			if len(store.PendingInventoryMutations()) != 1 {
 				t.Fatal("lost inventory ACK discarded mutation")
 			}
@@ -481,7 +546,9 @@ func TestRemoteTransitionsReplayCompletionBeforeInventory(t *testing.T) {
 			if err := host.client.Connect(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			host.flushInventoryMutations(t.Context(), host.client)
+			if err := host.flushInventoryMutations(t.Context(), host.client); err != nil {
+				t.Fatal(err)
+			}
 			if len(store.PendingInventoryMutations()) != 0 || len(host.syncRequest().Connectors) != 1 {
 				t.Fatal("acknowledged artifact did not become reportable")
 			}

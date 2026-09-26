@@ -412,21 +412,7 @@ func connectorCommand(root string, args []string, stdout, stderr io.Writer) erro
 
 func statusCommand(root, id string, jsonOutput bool, stdout io.Writer) error {
 	printStatuses := func(statuses []connectorhost.LocalConnectorStatus) error {
-		if jsonOutput {
-			encoder := json.NewEncoder(stdout)
-			encoder.SetIndent("", "  ")
-			return encoder.Encode(statuses)
-		}
-		writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
-		if _, err := fmt.Fprintln(writer, "ID\tNAME\tVERSION\tREADINESS\tROLLBACK\tSHA256"); err != nil {
-			return err
-		}
-		for _, status := range statuses {
-			if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%t\t%s\n", status.InstallationID, status.DisplayName, status.ArtifactVersion, status.Readiness, status.HasRollback, status.ArtifactDigest); err != nil {
-				return err
-			}
-		}
-		return writer.Flush()
+		return writeConnectorStatuses(stdout, statuses, jsonOutput)
 	}
 	return controlFirst(root, true,
 		func(ctx context.Context, client *connectorhost.LocalControlClient) error {
@@ -443,6 +429,24 @@ func statusCommand(root, id string, jsonOutput bool, stdout io.Writer) error {
 			}
 			return err
 		})
+}
+
+func writeConnectorStatuses(stdout io.Writer, statuses []connectorhost.LocalConnectorStatus, jsonOutput bool) error {
+	if jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		return encoder.Encode(statuses)
+	}
+	writer := tabwriter.NewWriter(stdout, 0, 4, 2, ' ', 0)
+	if _, err := fmt.Fprintln(writer, "ID\tNAME\tVERSION\tREADINESS\tERROR\tROLLBACK\tSHA256"); err != nil {
+		return err
+	}
+	for _, status := range statuses {
+		if _, err := fmt.Fprintf(writer, "%s\t%s\t%s\t%s\t%s\t%t\t%s\n", status.InstallationID, status.DisplayName, status.ArtifactVersion, status.Readiness, status.Error, status.HasRollback, status.ArtifactDigest); err != nil {
+			return err
+		}
+	}
+	return writer.Flush()
 }
 
 func controlFirst(root string, readOnly bool, remote func(context.Context, *connectorhost.LocalControlClient) error, direct func(context.Context, *connectorhost.Host, *connectorhost.Store) error) error {

@@ -92,6 +92,14 @@ func TestManifestInspectionAcceptsSettingJSONName(t *testing.T) {
 	}
 }
 
+func TestManifestTargetRequiresSupportedHostedChildProtocol(t *testing.T) {
+	manifest := helperManifest()
+	manifest.Features = []string{"hosted-child-v2"}
+	if err := validateManifestTarget(manifest); err == nil || !strings.Contains(err.Error(), "hosted-child-v1") {
+		t.Fatalf("validateManifestTarget() error = %v", err)
+	}
+}
+
 func TestManifestInspectionTimeoutTerminatesProcessTree(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
