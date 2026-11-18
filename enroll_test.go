@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/airlockrun/agentsdk/connector/protocol"
 )
 
 func TestUnenrolledHostStaysAvailableAndEnrollsThroughLocalControl(t *testing.T) {
@@ -18,6 +20,13 @@ func TestUnenrolledHostStaysAvailableAndEnrollsThroughLocalControl(t *testing.T)
 		w.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/api/hosts/v1/enroll/device-code":
+			var info protocol.HostInfo
+			if err := json.NewDecoder(request.Body).Decode(&info); err != nil {
+				t.Error(err)
+			}
+			if info.ProtocolVersion != 2 {
+				t.Errorf("host enrollment version = %d, want management V2", info.ProtocolVersion)
+			}
 			_ = json.NewEncoder(w).Encode(hostDeviceCodeResponse{
 				DeviceSecret:        "device-secret",
 				UserCode:            "ABCD-EFGH",

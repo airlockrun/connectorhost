@@ -28,3 +28,7 @@ contents:
     expand: true
     file_info:
       mode: 0755
+  - src: THIRD_PARTY_NOTICES.md
+    dst: /usr/share/doc/airlock-host/THIRD_PARTY_NOTICES.md
+    file_info:
+      mode: 0644

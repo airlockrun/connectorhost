@@ -16,6 +16,22 @@ import (
 	"github.com/airlockrun/agentsdk/connector/protocol"
 )
 
+func TestSyncAdvertisesManagementProtocol(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	host := newTestHost(store, nil)
+	request := host.syncRequest()
+	if request.Host.ProtocolVersion != 2 {
+		t.Fatalf("host management version = %d", request.Host.ProtocolVersion)
+	}
+	if err := protocol.ValidateHostSyncRequest(request); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestManagementSurvivesSessionReconnect(t *testing.T) {
 	store, err := OpenStore(t.TempDir())
 	if err != nil {
@@ -37,6 +53,9 @@ func TestManagementSurvivesSessionReconnect(t *testing.T) {
 	server := controlTestServer(t, func(m protocol.HostMessage) protocol.HostMessage {
 		switch {
 		case m.Sync != nil:
+			if m.Sync.Host.ProtocolVersion != 2 {
+				t.Errorf("WSS synchronization version = %d, want management V2", m.Sync.Host.ProtocolVersion)
+			}
 			synced <- struct{}{}
 			return protocol.HostMessage{Synced: &protocol.HostSyncResponse{HostID: "host", HeartbeatSeconds: 20}}
 		case m.Demand != nil:
@@ -92,6 +111,60 @@ func TestManagementSurvivesSessionReconnect(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("shell did not complete across reconnect")
+	}
+}
+
+func TestManagementCancellationFencesExactAttemptAndStopsShell(t *testing.T) {
+	store, err := OpenStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := filepath.Join(t.TempDir(), "cancel-shell")
+	input, err := json.Marshal(protocol.ShellInput{Command: executable, Environment: map[string]string{"AIRLOCK_CONNECTOR_HOST_TEST_SHELL_GATE": gate}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	completed := make(chan protocol.HostManagementCompletion, 2)
+	server := controlTestServer(t, func(m protocol.HostMessage) protocol.HostMessage {
+		if m.ManagementCompletion != nil {
+			completed <- *m.ManagementCompletion
+		}
+		return protocol.HostMessage{Ack: &struct{}{}}
+	})
+	if err := store.SetCredentials(server.URL, "credential", "host"); err != nil {
+		t.Fatal(err)
+	}
+	host := newTestHost(store, server.Client())
+	host.client = connectTestClient(t, server)
+	defer host.controlClient().Close()
+	work := protocol.HostWork{Kind: protocol.HostWorkShell, ManagementJob: &protocol.HostManagementJob{JobID: "cancel-job", AttemptToken: "cancel-attempt", Input: input, Deadline: time.Now().Add(30 * time.Second)}}
+	host.handleWork(t.Context(), work)
+	waitForTestPID(t, gate+".started")
+	host.handleWork(t.Context(), protocol.HostWork{Kind: protocol.HostWorkManagementCancel, Cancel: &protocol.ChildCancel{JobID: "foreign-job", AttemptToken: "cancel-attempt"}})
+	select {
+	case result := <-completed:
+		t.Fatalf("foreign job cancelled execution: %+v", result)
+	case <-time.After(30 * time.Millisecond):
+	}
+	host.handleWork(t.Context(), protocol.HostWork{Kind: protocol.HostWorkManagementCancel, Cancel: &protocol.ChildCancel{JobID: "cancel-job", AttemptToken: "foreign-attempt"}})
+	select {
+	case result := <-completed:
+		t.Fatalf("foreign attempt cancelled execution: %+v", result)
+	case <-time.After(30 * time.Millisecond):
+	}
+	host.handleWork(t.Context(), protocol.HostWork{Kind: protocol.HostWorkManagementCancel, Cancel: &protocol.ChildCancel{JobID: "cancel-job", AttemptToken: "cancel-attempt"}})
+	select {
+	case result := <-completed:
+		if result.Status != "canceled" {
+			t.Fatalf("cancellation outcome %+v", result)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("management cancellation did not terminate shell")
 	}
 }
 

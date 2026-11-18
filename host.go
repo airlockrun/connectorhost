@@ -36,6 +36,7 @@ type Host struct {
 	managementMu       sync.Mutex
 	activeManagementMu sync.RWMutex
 	activeManagement   map[string]protocol.ActiveAttempt
+	managementCancels  map[string]context.CancelFunc
 }
 
 func NewHost(store *Store, httpClient *http.Client, logger *slog.Logger) *Host {
@@ -45,7 +46,7 @@ func NewHost(store *Store, httpClient *http.Client, logger *slog.Logger) *Host {
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	host := &Host{store: store, httpClient: httpClient, logger: logger, credentialsReady: make(chan struct{}, 1), stateChanged: make(chan struct{}, 1), activeManagement: make(map[string]protocol.ActiveAttempt), outputFailure: make(chan error, 1)}
+	host := &Host{store: store, httpClient: httpClient, logger: logger, credentialsReady: make(chan struct{}, 1), stateChanged: make(chan struct{}, 1), activeManagement: make(map[string]protocol.ActiveAttempt), managementCancels: make(map[string]context.CancelFunc), outputFailure: make(chan error, 1)}
 	host.installer = NewArtifactInstaller(store, httpClient)
 	host.supervisor = NewSupervisor(store, host)
 	return host
@@ -465,6 +466,16 @@ func (h *Host) handleWork(ctx context.Context, work protocol.HostWork) {
 			h.logger.Info("connector command cancellation received", "connector_id", work.ConnectorID, "job_id", work.Cancel.JobID)
 			_ = h.supervisor.Cancel(work.ConnectorID, *work.Cancel)
 		}
+	case protocol.HostWorkManagementCancel:
+		if work.Cancel != nil {
+			h.activeManagementMu.Lock()
+			if attempt, ok := h.activeManagement[work.Cancel.AttemptToken]; ok && attempt.JobID == work.Cancel.JobID {
+				if cancel, ok := h.managementCancels[work.Cancel.AttemptToken]; ok {
+					cancel()
+				}
+			}
+			h.activeManagementMu.Unlock()
+		}
 	default:
 		if work.ManagementJob != nil {
 			h.activeManagementMu.Lock()
@@ -473,8 +484,13 @@ func (h *Host) handleWork(ctx context.Context, work protocol.HostWork) {
 				return
 			}
 			h.activeManagement[work.ManagementJob.AttemptToken] = protocol.ActiveAttempt{JobID: work.ManagementJob.JobID, AttemptToken: work.ManagementJob.AttemptToken}
+			commandCtx, cancel := context.WithCancel(ctx)
+			h.managementCancels[work.ManagementJob.AttemptToken] = cancel
 			h.activeManagementMu.Unlock()
-			go h.handleManagement(ctx, work.Kind, work.ConnectorID, *work.ManagementJob)
+			go func() {
+				defer cancel()
+				h.handleManagement(commandCtx, work.Kind, work.ConnectorID, *work.ManagementJob)
+			}()
 		}
 	}
 }
@@ -484,6 +500,7 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 	defer func() {
 		h.activeManagementMu.Lock()
 		delete(h.activeManagement, job.AttemptToken)
+		delete(h.managementCancels, job.AttemptToken)
 		h.activeManagementMu.Unlock()
 	}()
 	h.managementMu.Lock()
@@ -599,11 +616,8 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 				err = errors.New("connectorhost: management connector ID does not match artifact input")
 			} else {
 				input.InstallationID = connectorID
-				persist := h.store.PutRemoteConnector
-				if kind == protocol.HostWorkConnectorUpdate {
-					persist = func(record ConnectorRecord) error {
-						return h.store.PutRemoteTransition(record, protocol.ActiveAttempt{JobID: job.JobID, AttemptToken: job.AttemptToken})
-					}
+				persist := func(record ConnectorRecord) error {
+					return h.store.PutRemoteTransition(record, protocol.ActiveAttempt{JobID: job.JobID, AttemptToken: job.AttemptToken})
 				}
 				err = h.installRemote(ctx, input, kind == protocol.HostWorkConnectorUpdate, persist)
 			}
@@ -624,6 +638,9 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 			completion.Status = "canceled"
 		}
 		completion.Error = err.Error()
+		if completion.Status == "canceled" || completion.Status == "timeout" {
+			completion.Error = "connectorhost: management interrupted; effects may already exist: " + err.Error()
+		}
 		journal.Status, journal.Error = completion.Status, completion.Error
 		if saveErr := h.store.saveManagementOutcome(journal); saveErr != nil {
 			sendCompletion = false
@@ -631,7 +648,7 @@ func (h *Host) handleManagement(parent context.Context, kind protocol.HostWorkKi
 		return
 	}
 	completion.Status = "success"
-	if kind == protocol.HostWorkConnectorUpdate || kind == protocol.HostWorkConnectorRollback {
+	if kind == protocol.HostWorkConnectorInstall || kind == protocol.HostWorkConnectorUpdate || kind == protocol.HostWorkConnectorRollback {
 		journal.InventoryRevision = h.remoteInventoryRevision(connectorID, job.JobID)
 		completion.InventoryRevision = journal.InventoryRevision
 		if journal.InventoryRevision == 0 {

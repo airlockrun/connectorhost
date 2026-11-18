@@ -96,6 +96,10 @@ if command -v dpkg-deb >/dev/null 2>&1; then
       echo "Debian package does not contain /usr/bin/airlock-host: $package" >&2
       exit 1
     fi
+    if [[ $'\n'"$package_contents"$'\n' != *$'\n./usr/share/doc/airlock-host/THIRD_PARTY_NOTICES.md\n'* ]]; then
+      echo "Debian package does not contain third-party notices: $package" >&2
+      exit 1
+    fi
     control_contents="$(dpkg-deb --ctrl-tarfile "$package" | tar -tf -)"
     for script in postinst prerm postrm; do
       if [[ $'\n'"$control_contents"$'\n' != *$'\n./'"$script"$'\n'* ]]; then
@@ -121,6 +125,15 @@ else
   echo "rpm is not installed; skipped RPM metadata inspection" >&2
 fi
 
+for label in linux-amd64 linux-arm64 linux-armv7 darwin-amd64 darwin-arm64; do
+  archive="$OUTPUT_DIR/airlock-host-$version-$label.tar.gz"
+  archive_contents="$(tar -tzf "$archive")"
+  if [[ $'\n'"$archive_contents"$'\n' != *$'\n'"airlock-host-$version-$label/THIRD_PARTY_NOTICES.md"$'\n'* ]]; then
+    echo "archive does not contain third-party notices: $archive" >&2
+    exit 1
+  fi
+done
+
 for label in windows-amd64 windows-arm64; do
   archive="$OUTPUT_DIR/airlock-host-$version-$label.zip"
   archive_contents="$(unzip -Z1 "$archive")"
@@ -130,6 +143,10 @@ for label in windows-amd64 windows-arm64; do
   fi
   if [[ $'\n'"$archive_contents"$'\n' != *$'\ninstall-airlock-host.ps1\n'* ]]; then
     echo "Windows archive does not contain install-airlock-host.ps1: $archive" >&2
+    exit 1
+  fi
+  if [[ $'\n'"$archive_contents"$'\n' != *$'\nTHIRD_PARTY_NOTICES.md\n'* ]]; then
+    echo "Windows archive does not contain third-party notices: $archive" >&2
     exit 1
   fi
 done

@@ -7,6 +7,14 @@ NFPM="${NFPM:-nfpm}"
 NFPM_TOOL_VERSION="2.47.0"
 NFPM_MODULE_SUM="h1:0bioJAjWaMPntgDqynP4ze0Wt4zYqYSFJ5/BBy9XIGI="
 
+notice_check="$(mktemp)"
+trap 'rm -f "$notice_check"' EXIT
+bash "$ROOT_DIR/scripts/gen-notices.sh" "$notice_check"
+if ! cmp -s "$notice_check" "$ROOT_DIR/THIRD_PARTY_NOTICES.md"; then
+  echo "third-party notices do not match the compiled dependency graph" >&2
+  exit 1
+fi
+
 if ! command -v "$NFPM" >/dev/null 2>&1; then
   echo "nFPM $NFPM_TOOL_VERSION is required; install it with:" >&2
   echo "  go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v$NFPM_TOOL_VERSION" >&2
@@ -66,6 +74,7 @@ build_target() {
     binary="airlock-host.exe"
   fi
   mkdir -p "$directory"
+  cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$directory/THIRD_PARTY_NOTICES.md"
 
   if [[ "$label" == "linux-armv7" ]]; then
     GOOS="$goos" GOARCH=arm GOARM=7 CGO_ENABLED=0 GOWORK=off \
@@ -78,7 +87,7 @@ build_target() {
   if [[ "$goos" == "windows" ]]; then
     cp "$ROOT_DIR/scripts/install-airlock-host.ps1" "$directory/install-airlock-host.ps1"
     archive="$OUTPUT_DIR/airlock-host-$version-$label.zip"
-    (cd "$directory" && zip -q -9 "$archive" "$binary" install-airlock-host.ps1)
+    (cd "$directory" && zip -q -9 "$archive" "$binary" install-airlock-host.ps1 THIRD_PARTY_NOTICES.md)
   else
     archive="$OUTPUT_DIR/airlock-host-$version-$label.tar.gz"
     tar -C "$OUTPUT_DIR" -czf "$archive" "$(basename "$directory")"

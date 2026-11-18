@@ -178,6 +178,9 @@ func runHelperChild() {
 	if decoder.Decode(&envelope) != nil || envelope.Initialize == nil {
 		return
 	}
+	if envelope.Initialize.ProtocolVersion != 1 {
+		return
+	}
 	writeTestOrigins(os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_INITIALIZE_PATH"), envelope.Initialize.StorageOrigins)
 	if path := os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_INITIALIZE_PID_PATH"); path != "" {
 		_ = os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600)
@@ -191,7 +194,10 @@ func runHelperChild() {
 			_ = command.Process.Release()
 		}
 	}
-	ready := protocol.ChildReady{ProtocolVersion: protocol.HostProtocolVersion, Manifest: helperManifest(), Readiness: protocol.ReadinessReady}
+	ready := protocol.ChildReady{ProtocolVersion: 1, Manifest: helperManifest(), Readiness: protocol.ReadinessReady}
+	if os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD_VERSION") == "2" {
+		ready.ProtocolVersion = 2
+	}
 	if os.Getenv("AIRLOCK_CONNECTOR_HOST_TEST_READINESS") == "fail" {
 		ready.Readiness = protocol.ReadinessUnhealthy
 		ready.Error = "forced readiness failure"
