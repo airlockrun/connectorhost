@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM --platform=$BUILDPLATFORM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0 AS build
 
 ARG TARGETARCH
 ARG TARGETVARIANT
@@ -34,6 +34,7 @@ COPY --from=build /out/passwd /etc/passwd
 COPY --from=build /out/group /etc/group
 COPY --from=build --chown=65532:65532 /out/state/ /var/lib/airlock-host/
 COPY --from=build /out/airlock-host /usr/local/bin/airlock-host
+COPY THIRD_PARTY_NOTICES.md /usr/share/doc/airlock-host/THIRD_PARTY_NOTICES.md
 
 ENV HOME=/var/lib/airlock-host
 USER 65532:65532

@@ -217,7 +217,7 @@ func (s *Supervisor) launch(ctx context.Context, record ConnectorRecord) (*child
 			child.finish(err)
 			return
 		}
-		if envelope.Type != protocol.ChildMessageReady || envelope.Ready.ProtocolVersion != protocol.HostProtocolVersion {
+		if envelope.Type != protocol.ChildMessageReady || envelope.Ready.ProtocolVersion != protocol.ChildProtocolVersion {
 			err := errors.New("connectorhost: child returned invalid readiness handshake")
 			first <- err
 			child.finish(err)
@@ -273,7 +273,7 @@ func (s *Supervisor) launch(ctx context.Context, record ConnectorRecord) (*child
 			}
 		}
 	}()
-	initialization := protocol.ChildInitialize{ProtocolVersion: protocol.HostProtocolVersion, InstallationID: record.InstallationID, Settings: record.Settings, StateDirectory: s.store.ChildStateDirectory(record.InstallationID), StorageOrigins: record.StorageOrigins}
+	initialization := protocol.ChildInitialize{ProtocolVersion: protocol.ChildProtocolVersion, InstallationID: record.InstallationID, Settings: record.Settings, StateDirectory: s.store.ChildStateDirectory(record.InstallationID), StorageOrigins: record.StorageOrigins}
 	readyCtx, readyCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer readyCancel()
 	if err := child.encode(readyCtx, protocol.ChildEnvelope{Type: protocol.ChildMessageInitialize, Initialize: &initialization}); err != nil {

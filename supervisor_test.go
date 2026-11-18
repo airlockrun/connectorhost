@@ -14,6 +14,40 @@ import (
 	"github.com/airlockrun/agentsdk/connector/protocol"
 )
 
+func TestSupervisorChildProtocolIsIndependentOfManagement(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		childVersion string
+		valid        bool
+	}{
+		{name: "child-v1", childVersion: "1", valid: true},
+		{name: "management-v2-not-child", childVersion: "2"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := OpenStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			record := stageSupervisorTestConnector(t, store, "version-fixture", json.RawMessage(`{}`))
+			if err := store.PutConnector(record); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD", "1")
+			t.Setenv("AIRLOCK_CONNECTOR_HOST_TEST_CHILD_VERSION", test.childVersion)
+			supervisor := NewSupervisor(store, nil)
+			defer supervisor.Close(context.Background())
+			err = supervisor.Start(t.Context(), record.InstallationID)
+			if (err == nil) != test.valid {
+				t.Fatalf("child handshake %s: %v", test.childVersion, err)
+			}
+			if !test.valid && !strings.Contains(err.Error(), "invalid readiness handshake") {
+				t.Fatalf("wrong failure for child handshake %s: %v", test.childVersion, err)
+			}
+		})
+	}
+}
+
 func TestChildInitializationWriteHonorsDeadline(t *testing.T) {
 	store, err := OpenStore(filepath.Join(t.TempDir(), "instance"))
 	if err != nil {

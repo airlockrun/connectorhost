@@ -1,8 +1,8 @@
-github.com/airlockrun/agentsdk v0.7.0-rc.5 h1:CllsCJADqZKOKkwiD+Wk6N5UGLSeMp6GAii1OXdHEWM=
-github.com/airlockrun/agentsdk v0.7.0-rc.5/go.mod h1:d1z4PTFhp4NMHhqa7wKYlX/NwRYEwI41l8L2oQYlR4Q=
+github.com/airlockrun/agentsdk v0.9.0 h1:LOp/DdALQVp95m/NtXmK9IV3y6sf2CHxuXsoxLUVbio=
+github.com/airlockrun/agentsdk v0.9.0/go.mod h1:asZHI5Hy0U+0BN8RH3VAeyd9h1oCuuJmeJfikcAvpH4=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
-golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
-golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+golang.org/x/sys v0.49.0 h1:XbzkgYJHdqh/8m2Uu0W/dQv8nktxx4BFHp1M0gROTXA=
+golang.org/x/sys v0.49.0/go.mod h1:hNLxWAXmnKAxqDtdwIYC4bM9oQPEecfsnNMuSxOs3og=

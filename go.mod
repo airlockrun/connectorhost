@@ -1,11 +1,11 @@
 module github.com/airlockrun/connectorhost
 
-go 1.26.6
+go 1.26.11
 
 require (
-	github.com/airlockrun/agentsdk v0.7.0-rc.5
+	github.com/airlockrun/agentsdk v0.9.0
 	github.com/coder/websocket v1.8.14
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.49.0
 )
 
 require github.com/google/uuid v1.6.0

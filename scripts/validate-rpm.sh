@@ -22,7 +22,8 @@ for index in "${!linux_labels[@]}"; do
     echo "$metadata" >&2
     exit 1
   fi
-  if [[ "$(rpm -qlp "$package")" != "/usr/bin/airlock-host" ]]; then
+  expected_files=$'/usr/bin/airlock-host\n/usr/share/doc/airlock-host/THIRD_PARTY_NOTICES.md'
+  if [[ "$(rpm -qlp "$package" | LC_ALL=C sort)" != "$expected_files" ]]; then
     echo "unexpected RPM payload in $package" >&2
     exit 1
   fi
